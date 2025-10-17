@@ -33,8 +33,6 @@ class DataLoaderConf(Conf):
     instruct_timeout = FloatArg(None, min_value=0.1, allow_none=True)
     worker_timeout = FloatArg(None, min_value=0.1, allow_none=True)
     num_workers = IntArg(1, min_value=1)
-    num_ranks = IntArg(1, min_value=1)
-    rank_idx = IntArg(0, min_value=0)
     worker_indexes = [[IndexConf()]]
 
     @monitor_on('num_path')
@@ -79,9 +77,11 @@ class DataLoaderConf(Conf):
 
     def init_dataloader(
         self, 
+        rank_idx: int,
+        num_ranks: int,
         row_map_fn: Callable[[Row], Row] | None = None,
         row_flow_fn: Callable[[Iterable[Row]], Iterable[Row]] | None = None,
-        batch_map_fn: Callable[[Batch], Batch] | None = None
+        batch_map_fn: Callable[[Batch], Batch] | None = None,
     ) -> DataLoader:
         bs = self.batch_size.value()
         assert bs is not None
@@ -103,13 +103,12 @@ class DataLoaderConf(Conf):
             worker_timeout=self.worker_timeout.value(),
             restart_cnt=None,
             num_workers=self.num_workers.value(), # type: ignore
-            num_ranks=self.num_ranks.value(), # type: ignore
-            rank_idx=self.rank_idx.value(), # type: ignore
+            num_ranks=num_ranks,
+            rank_idx=rank_idx,
             batch_map_fn=batch_map_fn,
             distributor_weights=[weight.value() for weight in self.path_weight] # type: ignore
         )
 
 if __name__ == '__main__':
     conf = DataLoaderConf.parse_command_line()
-    conf.init_dataloader()
     print(conf)

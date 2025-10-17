@@ -134,7 +134,7 @@ class AdagradConfig(OptimizerConfigBase):
 
 
 @add_dependency('optimizer_type', 'optimizer')
-class OptimizerConf(Conf):
+class OptimizerConfig(Conf):
     optimizer_type = OptionArg('AdamW', options=['AdamW', 'Adam', 'SGD', 'Adadelta', 'Adagrad'])
     optimizer: OptimizerConfigBase = AdamWConfig()
 
@@ -158,5 +158,5 @@ class OptimizerConf(Conf):
         return self.optimizer.init_optimzier(params)
 
 if __name__ == '__main__':
-    conf = OptimizerConf.parse_command_line()
+    conf = OptimizerConfig.parse_command_line()
     print(conf)
