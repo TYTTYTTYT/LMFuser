@@ -126,7 +126,7 @@ def get_default_device_type() -> Literal['cuda', 'npu', 'cpu']:
     return DEVICE_TYPE
 
 DEVICE: Optional[str] = None
-def get_default_device() -> str:
+def get_default_device() -> str | int:
     """
     Get the default device for the current process.
     """
@@ -136,7 +136,9 @@ def get_default_device() -> str:
 
     device_type = get_default_device_type()
     if device_type == 'cpu':
-        return device_type
+        return -1
+    if device_type == 'cuda':
+        return get_local_rank()
 
     return f'{device_type}:{get_local_rank()}'
 

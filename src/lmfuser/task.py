@@ -147,6 +147,7 @@ class TaskBase(Conf, SubclassTracer):
         batch: Batch,
         step: int,
         device: Any,
+        acc_step: int,
         **kwargs: Any
     ) -> Batch | torch.Tensor:
         raise NotImplementedError('Please implement this method in child class')

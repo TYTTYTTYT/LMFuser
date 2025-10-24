@@ -102,7 +102,7 @@ class DDPRunnerConfig(RunerConf):
     optimizer: OptimizerConfig = OptimizerConfig()
     lr_scheduler: LRSchedulerConfig = LRSchedulerConfig()
 
-    dp_type = OptionArg(default='ddp', options=[])
+    dp_type = OptionArg(default='ddp', options=['ddp'])
     model_precision = OptionArg(options=['fp32', 'fp16'], default='fp32')
     use_amp = BoolArg(default=False)
     amp_precision = OptionArg(options=['fp16', 'bf16'], default='fp16')
@@ -188,7 +188,6 @@ class DDPRunner:
                 self.eval_task_idxs.append(idx)
 
         assert len(self.train_task_idxs) + len(self.eval_task_idxs) > 0, 'At least one train or eval task must be provided.'
-            
 
         self.task_weights: list[float] = [w.value() for w in config.task_conf.task_weights] # type: ignore
         self.train_task_weights = [self.task_weights[idx] for idx in self.train_task_idxs]
@@ -228,7 +227,7 @@ class DDPRunner:
     def save_model(self, model: nn.Module, directory: str, step: int, **kwargs: Any) -> None:
         path = Path(directory) / str(step)
         os.makedirs(path, exist_ok=True)
-        self.model_loader.save_model(model, directory)
+        self.model_loader.save_model(model, path)
 
     @property
     def model(self) -> DDPWraper:
@@ -252,9 +251,15 @@ class DDPRunner:
         for key, v in batch.items():
             if isinstance(v, Tensor):
                 if torch.is_floating_point(v):
-                    v = v.to(self.config.model_precision.value())
+                    precision = self.config.model_precision.value()
+                    if precision == 'fp32':
+                        v = v.to(torch.float32) if v.dtype != torch.float32 else v
+                    elif precision == 'fp16':
+                        v = v.to(torch.float16) if v.dtype != torch.float16 else v
+                    else:
+                        raise ValueError(f'Unknown model precision "{precision}"')
                 assert isinstance(batch, dict)
-                batch[key] = v.to(get_default_device())
+                batch[key] = v.to(get_default_device()) if v.get_device() != get_default_device() else v
         return batch
 
     def _prepare_train(
@@ -318,6 +323,11 @@ class DDPRunner:
             self._logger = getLogger(self.__class__.__name__)
         return self._logger
 
+    @property
+    def epoch(self) -> int:
+        epochs = [loader.epoch for loader in self.train_data_loaders if loader is not None]
+        return max(epochs)
+
     def step_log(self, data: dict[str, Any]) -> None:
         self._wandb
         if get_global_rank() != 0:
@@ -336,7 +346,7 @@ class DDPRunner:
         # calculate loss
         running_loss: float = 0.0
         batch_datas: defaultdict[Hashable, List[float]] = defaultdict(list)
-        for _ in range(self.config._num_acc_steps):
+        for acc_idx in range(self.config._num_acc_steps):
             with ExitStack() as stack:
                 # check whether to use amp
                 if all([
@@ -359,8 +369,11 @@ class DDPRunner:
                     model=self.model,
                     batch=self._batch_to_device(self._next_train_batch(task_id)),
                     step=self.step, 
-                    device=get_local_rank()
-                ) 
+                    device=get_local_rank(),
+                    acc_step=acc_idx,
+                )
+                if isinstance(subbatch_result, torch.Tensor):
+                    subbatch_result = {'loss': subbatch_result}
                 if 'loss' not in subbatch_result:
                     raise KeyError('no loss returned from the batch')
                 assert isinstance(subbatch_result, dict)
@@ -382,6 +395,7 @@ class DDPRunner:
                 loss.backward()
         running_loss = dist_avg(running_loss)
         self.step_log({f'{task.__class__.__name__}/train/loss': running_loss})
+        self.step_log({'train/epoch': self.epoch})
         for k, v in batch_datas.items():
             try:
                 avg = sum(v) / len(v)
@@ -459,7 +473,7 @@ class DDPRunner:
             logger.info('begin to evaluate the model')
             self.eval()
             logger.info('model evaluated!')
-        self._step += 1
+        self.step += 1
 
     def train(self, **kwargs: Any) -> None:
         self._prepare_train()
