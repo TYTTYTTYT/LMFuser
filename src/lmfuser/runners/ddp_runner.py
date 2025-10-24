@@ -46,7 +46,7 @@ from ..utils import (
 from ..optimizers import OptimizerConfig
 from ..schedulers import LRSchedulerConfig
 from ..model_loader import ModelLoader, ModelLoaderConf
-from .runner import RunerConf
+from .runner import RunerConf, Runner
 
 logger = logging.getLogger(__name__)
 
@@ -131,21 +131,19 @@ class DDPRunnerConfig(RunerConf):
         sbs = self.sub_batch_size.value()
         assert bs is not None and sbs is not None
 
-        if bs % sbs != 0:
+        if bs % (sbs * get_world_size()) != 0:
             raise ValueError(
-                f'batch_size ({bs}) must be divisible by sub_batch_size ({sbs})'
+                f'batch_size ({bs}) must be divisible by sub_batch_size * world_size ({sbs * get_world_size()})'
             )
-        return bs // sbs
+        return bs // (sbs * get_world_size())
 
 
-class DDPRunner:
+class DDPRunner(Runner[DDPRunnerConfig]):
 
     def __init__(self, config: DDPRunnerConfig, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__(config, *args, **kwargs)
         if get_world_size() > 1:
             dist_init()
-
-        self.config = config
 
         self.tasks = [task.conf for task in config.task_conf.tasks]
 
@@ -475,7 +473,7 @@ class DDPRunner:
             logger.info('model evaluated!')
         self.step += 1
 
-    def train(self, **kwargs: Any) -> None:
+    def train(self, *args: Any, **kwargs: Any) -> None:
         self._prepare_train()
 
         self._pbar_train = tqdm(
@@ -530,7 +528,7 @@ class DDPRunner:
         for k, v in metrics.items():
             self.step_log({f'{task.__class__.__name__}/dev/{k}': v})
 
-    def eval(self, **kwargs: Any) -> None:
+    def eval(self, *args: Any, **kwargs: Any) -> None:
         for task in tqdm(
             self.tasks, 
             dynamic_ncols=True, 
@@ -542,3 +540,13 @@ class DDPRunner:
         ):
             if task.is_evaluatable:
                 self._eval_one_task(task)
+
+    def produce(self, *args: Any, **kwargs: Any) -> None:
+        raise NotImplementedError('produce method not implemented')
+
+    def save(self, directory: str | os.PathLike, *args, **kwargs) -> None:
+        raise NotImplementedError('save method not implemented')
+
+    @classmethod
+    def load(cls, directory: str | os.PathLike, *args, **kwargs) -> None:
+        raise NotImplementedError('load method not implemented')
