@@ -283,10 +283,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         if scaler is None:
             if self.config.use_amp and get_world_size() > 1:
-                if OLD_GRADSCALER:
-                    self.scaler = GradScaler()
+                amp_selection = self.config.amp_precision.value()
+                if amp_selection == 'fp16':
+                    enable_scaler = True
+                elif amp_selection == 'bf16':
+                    enable_scaler = False
                 else:
-                    self.scaler = GradScaler(device=get_default_device_type()) # type: ignore
+                    raise ValueError(f'Unknown amp precision "{amp_selection}"')
+                if OLD_GRADSCALER:
+                    self.scaler = GradScaler(enabled=enable_scaler)
+                else:
+                    self.scaler = GradScaler(device=get_default_device_type(), enabled=enable_scaler) # type: ignore
             else:
                 self.scaler = None
         else:
