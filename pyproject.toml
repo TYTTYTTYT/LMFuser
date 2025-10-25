@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling >= 1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "LMFuser"
+version = "0.0.1"
+requires-python = ">= 3.11"
+description = "The LMFuser training framework."
+readme = "README.md"
+keywords = ["machine learning", "pytorch"]
+classifiers = [
+  "Topic :: Utilities",
+  "Programming Language :: Python :: 3 :: Only",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Information Technology"
+]
+dependencies = [
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "torch",
+  "LMFuser-data",
+  "tqdm",
+  "wandb"
+]
+authors = [
+  {name = "Yintao Tai", email = "tai.yintao@gmail.com"},
+]
+maintainers = [
+  {name = "Yintao Tai", email = "tai.yintao@gmail.com"},
+]
+
+[project.urls]
+Homepage = "https://github.com/TYTTYTTYT/LMFuser"
+Documentation = "https://github.com/TYTTYTTYT/LMFuser"
+Repository = "https://github.com/TYTTYTTYT/LMFuser"
+"Bug Tracker" = "https://github.com/TYTTYTTYT/LMFuser"
+Changelog = "https://github.com/TYTTYTTYT/LMFuser"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lmfuser"]
