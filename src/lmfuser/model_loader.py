@@ -9,7 +9,7 @@ class ModelLoader(SubclassTracer):
     def __init__(self, model_path: str | PathLike):
         self.model_path = model_path
 
-    def load_model(self):
+    def load_model(self) -> nn.Module:
         raise NotImplementedError(f'Not implemented load_model for {self.__class__.__name__}')
 
     @classmethod

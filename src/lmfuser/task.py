@@ -162,6 +162,9 @@ class TaskBase(Conf, SubclassTracer):
     ) -> dict[str, list[Any]]:
         raise NotImplementedError('Please implement this method in child class')
 
+    def cal_dev_metric(self, eval_outputs: dict[str, list[Any]]) -> dict[str, Any]:
+        raise NotImplementedError('Please implement this method in child class')
+
     def get_row_processor(self) -> Callable[[Row], Row] | None:
         return None
 

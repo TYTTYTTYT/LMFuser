@@ -6,6 +6,7 @@ import logging
 import os
 import random
 from pathlib import Path
+import json
 from logging import Logger, getLogger
 
 import torch
@@ -88,7 +89,9 @@ class DDPRunnerConfig(RunerConf):
     checkpoint_directory = StrArg('please set checkpoint directory here!')
     model_loader_conf = ModelLoaderConf()
 
+    stop_by = OptionArg('step', options=['step', 'epoch'])
     total_step = IntArg(100, min_value=1)
+    total_epoch = IntArg(10, min_value=1)
     eval_step_freq = IntArg(100, min_value=1)
     save_step_freq = IntArg(100, min_value=1)
 
@@ -115,6 +118,9 @@ class DDPRunnerConfig(RunerConf):
     shuffle_dataset = BoolArg(default=True)
     row_prefetch = IntArg(0, min_value=0)
     num_row_workers = IntArg(1, min_value=1)
+
+    resume_training = BoolArg(default=False)
+    resume_path = StrArg(default=None, allow_none=True)
 
     @property
     def _default_precision(self) -> torch.dtype:
@@ -146,6 +152,15 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             dist_init()
 
         self.tasks = [task.conf for task in config.task_conf.tasks]
+        self.step = 1
+        self.pre_epoch = 0
+        self.model_loader = config.model_loader_conf.get_model_loader()
+
+        if config.resume_training.value():
+            resume_path = config.resume_path.value()
+            assert resume_path is not None, 'resume_path is None'
+            self.load(resume_path)
+        self.config.seed = self.config.seed.parse(hash(f'original_seed_{self.config.seed.value()}|step_{self.step}'))
 
         self.train_data_loaders = config.task_conf.get_train_dataloaders(
             batch_size=config.sub_batch_size.value(), # type: ignore
@@ -192,12 +207,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         self.eval_task_weights = [self.task_weights[idx] for idx in self.eval_task_idxs]
         self.task_rand_g = random.Random(config.seed.value())
 
-        self.model_loader = config.model_loader_conf.get_model_loader()
-
         self.train_iters = [iter(loader) if loader is not None else None for loader in self.train_data_loaders]
         self.eval_iters = [iter(loader) if loader is not None else None for loader in self.eval_data_loaders]
-
-        self.step = 1
 
     def sample_train_task_id(self) -> int:
         '''
@@ -222,10 +233,24 @@ class DDPRunner(Runner[DDPRunnerConfig]):
     def load_model(self, **kwargs: Any) -> nn.Module:
         return self.model_loader.load_model()
 
-    def save_model(self, model: nn.Module, directory: str, step: int, **kwargs: Any) -> None:
+    def save(self, model: nn.Module, directory: str, step: int, **kwargs: Any) -> None:
         path = Path(directory) / str(step)
         os.makedirs(path, exist_ok=True)
         self.model_loader.save_model(model, path)
+
+        optimizer_path = path / 'optimizer.pt'
+        torch.save(self.optimizer.state_dict(), optimizer_path)
+
+        scheduler_path = path / 'scheduler.pt'
+        torch.save(self.scheduler.state_dict(), scheduler_path)
+
+        runner_path = path / 'runner.json'
+        with open(runner_path, 'w') as f:
+            f.write(json.dumps({
+                'step': step + 1,
+                'epoch': self.epoch,
+                'config': self.config.to_dict(),
+            }, indent=4))
 
     @property
     def model(self) -> DDPWraper:
@@ -238,12 +263,19 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         return self._model
 
     def _should_stop(self) -> bool:
-        total_step = self.config.total_step.value()
-        assert total_step is not None
-        if self.step > total_step:
-            return True
+        stop_metric = self.config.stop_by.value()
+        assert stop_metric in ('step', 'epoch')
+
+        if stop_metric == 'step':
+            total_step = self.config.total_step.value()
+            assert total_step is not None
+            return self.step > total_step
+        elif stop_metric == 'epoch':
+            total_epoch = self.config.total_epoch.value()
+            assert total_epoch is not None
+            return self.epoch >= total_epoch
         else:
-            return False
+            raise ValueError(f'stop_metric must be either "epoch" or "step", got "{stop_metric}" instead.')
 
     def _batch_to_device(self, batch: Batch) -> Batch:
         for key, v in batch.items():
@@ -273,6 +305,12 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             )
         else:
             self.optimizer = optimizer
+        if hasattr(self, '_optimizer_states'):
+            self.optimizer.load_state_dict(self._optimizer_states)
+            for state in self.optimizer.state.values():
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        state[k] = v.to(get_default_device(), non_blocking=True)
 
         if scheduler is None:
             self.scheduler = self.config.lr_scheduler.init_lr_scheduler(
@@ -280,6 +318,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             )
         else:
             self.scheduler = scheduler
+        if hasattr(self, '_scheduler_states'):
+            self.scheduler.load_state_dict(self._scheduler_states)
 
         if scaler is None:
             if self.config.use_amp and get_world_size() > 1:
@@ -302,7 +342,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
     def _next_train_batch(self, task_idx: int) -> Batch:
         if self.train_data_loaders[task_idx] is None:
             raise ValueError(f'No train dataloader for task {task_idx}')
-        
+
         it = self.train_iters[task_idx]
         assert it is not None
         try:
@@ -331,7 +371,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
     @property
     def epoch(self) -> int:
         epochs = [loader.epoch for loader in self.train_data_loaders if loader is not None]
-        return max(epochs)
+        return max(epochs) + self.pre_epoch
 
     def step_log(self, data: dict[str, Any]) -> None:
         self._wandb
@@ -463,9 +503,9 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             to_save = self.model.model.module
             ckpt_path = self.config.checkpoint_directory.value()
             assert ckpt_path is not None
-            self.save_model(
+            self.save(
                 to_save,  # type: ignore
-                ckpt_path, 
+                ckpt_path,
                 self.step
             )
             logger.info('model saved!')
@@ -499,13 +539,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
     def _eval_one_task(self, task_id: int, **kwargs: Any) -> None:
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
+        dataloader = self.eval_data_loaders[task_id]
+        task = self.tasks[task_id]
+
         batch_list: list[dict[str, list[Any]]] = []
         with ExitStack() as stack:
             stack.enter_context(torch.no_grad())
             if get_world_size() > 1:
                 stack.enter_context(self.model.model.no_sync())
             for batch in tqdm(
-                task.get_eval_dataloader(),
+                dataloader,
                 dynamic_ncols=True,
                 desc=f'evaluating task {task.__class__.__name__}',
                 position=2,
@@ -536,8 +580,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self.step_log({f'{task.__class__.__name__}/dev/{k}': v})
 
     def eval(self, *args: Any, **kwargs: Any) -> None:
-        for task in tqdm(
-            self.tasks, 
+        for task_id in tqdm(
+            self.eval_task_idxs, 
             dynamic_ncols=True, 
             desc=f'evaluating {len(self.tasks)} tasks...',
             position=2,
@@ -545,15 +589,31 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             leave=False,
             unit='task'
         ):
-            if task.is_evaluatable:
-                self._eval_one_task(task)
+            self._eval_one_task(task_id)
 
     def produce(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError('produce method not implemented')
 
-    def save(self, directory: str | os.PathLike, *args, **kwargs) -> None:
-        raise NotImplementedError('save method not implemented')
+    def load(self, directory: str | os.PathLike, *args, **kwargs) -> None:
+        self.model_loader.model_path = directory
 
-    @classmethod
-    def load(cls, directory: str | os.PathLike, *args, **kwargs) -> None:
-        raise NotImplementedError('load method not implemented')
+        optimizer_path = Path(directory) / 'optimizer.pt'
+        if optimizer_path.exists():
+            self._optimizer_states = torch.load(optimizer_path)
+        else:
+            logger.warning(f'optimizer.pt not found in {directory}, skip loading optimizer')
+
+        scheduler_path = Path(directory) / 'scheduler.pt'
+        if scheduler_path.exists():
+            self._scheduler_states = torch.load(scheduler_path)
+        else:
+            logger.warning(f'scheduler.pt not found in {directory}, skip loading scheduler')
+
+        runner_path = Path(directory) / 'runner.json'
+        if runner_path.exists():
+            with open(runner_path, 'r') as f:
+                runner_state = json.load(f)
+                self.step = int(runner_state['step'])
+                self.pre_epoch = int(runner_state['epoch'])
+        else:
+            logger.warning(f'runner.json not found in {directory}, skip loading runner state')

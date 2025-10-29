@@ -35,7 +35,6 @@ class Runner(ABC, Generic[ConfType]):
     def save(self, directory: str | os.PathLike, *args, **kwargs) -> None:
         raise NotImplementedError('produce method not implemented')
 
-    @classmethod
     @abstractmethod
-    def load(cls, directory: str | os.PathLike, *args, **kwargs) -> None:
+    def load(self, directory: str | os.PathLike, *args, **kwargs) -> None:
         raise NotImplementedError('load method not implemented')
