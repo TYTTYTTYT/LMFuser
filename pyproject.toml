@@ -22,7 +22,8 @@ dependencies = [
   "torch",
   "LMFuser-data",
   "tqdm",
-  "wandb"
+  "wandb",
+  "HyperArgs>=0.1.3",
 ]
 authors = [
   {name = "Yintao Tai", email = "tai.yintao@gmail.com"},
