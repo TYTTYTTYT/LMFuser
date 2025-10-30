@@ -432,7 +432,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                     if isinstance(v, (float, int)):
                         batch_datas[k].append(float(v))
                     elif isinstance(v, (list)) and len(v) > 0 and isinstance(v[0], (float, int)):
-                        batch_datas[k].extend([float(i) for i in v])
+                        batch_datas[k].extend([float(i) for i in v]) # type: ignore
 
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
@@ -524,9 +524,10 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         self._prepare_train()
 
         self._pbar_train = tqdm(
-            total=self.config.total_step.value(), 
-            position=0, 
-            dynamic_ncols=True, 
+            total=self.config.total_step.value(),
+            position=0,
+            initial=self.step - 1,
+            dynamic_ncols=True,
             unit='step',
             disable=True if get_global_rank() != 0 else False
         )
