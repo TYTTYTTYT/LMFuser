@@ -257,7 +257,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         model = getattr(self, '_model', None)
         if model is None:
             model = self.load_model()
-            if self.config.model_precision == 'fp16':
+            if self.config.model_precision.value() == 'fp16':
+                logger.critical(f'casting model to fp16')
                 model = model.half()
             self._model = DDPWraper(model)
         return self._model
@@ -322,20 +323,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self.scheduler.load_state_dict(self._scheduler_states)
 
         if scaler is None:
-            if self.config.use_amp and get_world_size() > 1:
-                amp_selection = self.config.amp_precision.value()
-                if amp_selection == 'fp16':
-                    enable_scaler = True
-                elif amp_selection == 'bf16':
-                    enable_scaler = False
-                else:
-                    raise ValueError(f'Unknown amp precision "{amp_selection}"')
-                if OLD_GRADSCALER:
-                    self.scaler = GradScaler(enabled=enable_scaler)
-                else:
-                    self.scaler = GradScaler(device=get_default_device_type(), enabled=enable_scaler) # type: ignore
+            if self.config.use_amp.value() and self.config.amp_precision.value() == 'fp16':
+                enable_scaler = True
             else:
-                self.scaler = None
+                enable_scaler = False
+            if self.config.model_precision.value() == 'fp16':
+                enable_scaler = False
+
+            if OLD_GRADSCALER:
+                self.scaler = GradScaler(enabled=enable_scaler)
+            else:
+                self.scaler = GradScaler(device=get_default_device_type(), enabled=enable_scaler) # type: ignore
         else:
             self.scaler = scaler
 
@@ -394,12 +392,9 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         for acc_idx in range(self.config._num_acc_steps):
             with ExitStack() as stack:
                 # check whether to use amp
-                if all([
-                    self.config.use_amp,
-                    self.config.model_precision == 'fp32',
-                    get_world_size() > 1
-                ]):
+                if self.config.use_amp.value():
                     amp_selection = self.config.amp_precision.value()
+                    logger.critical(f'using amp with precision {amp_selection}')
                     assert amp_selection is not None
                     stack.enter_context(autocast(
                         device_type='cuda',
