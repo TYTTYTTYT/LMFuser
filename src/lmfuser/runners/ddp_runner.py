@@ -438,6 +438,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
+
         running_loss = dist_avg(running_loss)
         self.step_log({f'{task.__class__.__name__}/train/loss': running_loss})
         self.step_log({'train/epoch': self.epoch})
@@ -453,6 +454,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         grad_norm_clip_val = self.config.grad_norm_clip.value()
         if grad_norm_clip_val is not None:
+            if self.scaler is not None:
+                self.scaler.unscale_(self.optimizer)
             norm = clip_grad_norm_(
                 parameters=self.model.parameters(), 
                 max_norm=grad_norm_clip_val
