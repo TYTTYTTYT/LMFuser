@@ -394,7 +394,6 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 # check whether to use amp
                 if self.config.use_amp.value():
                     amp_selection = self.config.amp_precision.value()
-                    logger.critical(f'using amp with precision {amp_selection}')
                     assert amp_selection is not None
                     stack.enter_context(autocast(
                         device_type='cuda',
