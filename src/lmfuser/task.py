@@ -1,19 +1,16 @@
-from abc import ABC
-from typing import TypeVar, Any, Callable
+from typing import Any, Callable
 from collections.abc import Iterable
 
 import torch
 from torch import nn
 from lmfuser_data.interfaces import Batch, Row
 from lmfuser_data.scanners import Scanner
-from lmfuser_data import DataLoader
+from lmfuser_data import DataLoader, PyTorchDataLoader
 from lmfuser_data.interfaces import SubclassTracer
 from hyperargs import Conf, StrArg, FloatArg, IntArg, OptionArg, add_dependency, monitor_on
 
-
 def scanner_type_list() -> list[str]:
     return list(Scanner.all_subclass_names())
-
 
 @add_dependency('num_train_data_path', 'train_data_path_list')
 @add_dependency('num_train_data_path', 'train_data_weights')
@@ -28,8 +25,11 @@ class TaskBase(Conf, SubclassTracer):
 
     scanner_type = OptionArg(default='C4Scanner', option_fn=scanner_type_list)
 
-    _train_dataloader: DataLoader | None = None
-    _eval_dataloader: DataLoader | None = None
+    train_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded'])
+    eval_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded'])
+
+    _train_dataloader: DataLoader | None | PyTorchDataLoader = None
+    _eval_dataloader: DataLoader | None | PyTorchDataLoader = None
 
     @monitor_on('num_train_data_path')
     def set_train_path_list(self) -> None:
@@ -66,7 +66,7 @@ class TaskBase(Conf, SubclassTracer):
         num_workers: int,
         rank: int,
         world_size: int
-    ) -> DataLoader | None:
+    ) -> None | DataLoader | PyTorchDataLoader:
         if self.num_train_data_path.value() == 0:
             return None
         if self._train_dataloader is not None:
@@ -76,25 +76,45 @@ class TaskBase(Conf, SubclassTracer):
         scanner_type = self.scanner_type.value()
         assert scanner_type is not None, 'scanner_type is None'
 
-        self._train_dataloader = DataLoader(
-            batch_size=batch_size,
-            path_list=path_list, # type: ignore
-            distributor_weights=weight_list, # type: ignore
-            scanner_type=Scanner.get_subclass(scanner_type),
-            seed=seed,
-            shuffle=shuffle,
-            pre_fetch_factor=prefetch_factor,
-            ignore_error=ignore_error,
-            qps=qps,
-            instruct_timeout=instruct_timeout,
-            worker_timeout=worker_timeout,
-            num_workers=num_workers,
-            map_fn=self.get_row_processor(),
-            flow_fn=self.get_flow_processor(),
-            batch_map_fn=self.get_batch_processor(),
-            rank_idx=rank,
-            num_ranks=world_size,
-        )
+        dataloader_type = self.train_dataloader_type.value()
+        assert dataloader_type in ('sharded', 'single file'), f'Unknown dataloader type: {dataloader_type}'
+
+        if dataloader_type == 'sharded':
+            self._train_dataloader = DataLoader(
+                batch_size=batch_size,
+                path_list=path_list, # type: ignore
+                distributor_weights=weight_list, # type: ignore
+                scanner_type=Scanner.get_subclass(scanner_type),
+                seed=seed,
+                shuffle=shuffle,
+                pre_fetch_factor=prefetch_factor,
+                ignore_error=ignore_error,
+                qps=qps,
+                instruct_timeout=instruct_timeout,
+                worker_timeout=worker_timeout,
+                num_workers=num_workers,
+                map_fn=self.get_row_processor(),
+                flow_fn=self.get_flow_processor(),
+                batch_map_fn=self.get_batch_processor(),
+                rank_idx=rank,
+                num_ranks=world_size,
+            )
+        elif dataloader_type == 'single file':
+            PyTorchDataLoader(
+                batch_size=batch_size,
+                path_list=path_list, # type: ignore
+                scanner_type=Scanner.get_subclass(scanner_type),
+                seed=seed,
+                shuffle=shuffle,
+                pre_fetch_factor=prefetch_factor,
+                num_workers=num_workers,
+                num_ranks=world_size,
+                rank_idx=rank,
+                collate_fn=self.get_collate_fn(),
+                drop_last=False
+            )
+        else:
+            raise ValueError(f'Unknown dataloader type: {dataloader_type}')
 
         return self._train_dataloader
 
@@ -111,7 +131,7 @@ class TaskBase(Conf, SubclassTracer):
         num_workers: int,
         rank: int,
         world_size: int
-    ) -> DataLoader | None:
+    ) -> None | DataLoader | PyTorchDataLoader:
         if self.num_eval_data_path.value() == 0:
             return None
         if self._eval_dataloader is not None:
@@ -120,25 +140,49 @@ class TaskBase(Conf, SubclassTracer):
         weight_list = [w.value() for w in self.eval_data_weights]
         scanner_type = self.scanner_type.value()
         assert scanner_type is not None, 'scanner_type is None'
-        self._eval_dataloader = DataLoader(
-            batch_size=batch_size,
-            path_list=path_list, # type: ignore
-            distributor_weights=weight_list, # type: ignore
-            scanner_type=Scanner.get_subclass(scanner_type),
-            seed=seed,
-            shuffle=shuffle,
-            pre_fetch_factor=prefetch_factor,
-            ignore_error=ignore_error,
-            qps=qps,
-            instruct_timeout=instruct_timeout,
-            worker_timeout=worker_timeout,
-            num_workers=num_workers,
-            map_fn=self.get_row_processor(),
-            flow_fn=self.get_flow_processor(),
-            batch_map_fn=self.get_batch_processor(),
-            rank_idx=rank,
-            num_ranks=world_size,
-        )
+
+        dataloader_type = self.eval_dataloader_type.value()
+        assert dataloader_type is not None, 'dataloader_type is None'
+
+        dataloader_type = self.eval_dataloader_type.value()
+        assert dataloader_type in ('sharded', 'single file'), f'Unknown dataloader type: {dataloader_type}'
+
+        if dataloader_type == 'sharded':
+            self._eval_dataloader = DataLoader(
+                batch_size=batch_size,
+                path_list=path_list, # type: ignore
+                distributor_weights=weight_list, # type: ignore
+                scanner_type=Scanner.get_subclass(scanner_type),
+                seed=seed,
+                shuffle=shuffle,
+                pre_fetch_factor=prefetch_factor,
+                ignore_error=ignore_error,
+                qps=qps,
+                instruct_timeout=instruct_timeout,
+                worker_timeout=worker_timeout,
+                num_workers=num_workers,
+                map_fn=self.get_row_processor(),
+                flow_fn=self.get_flow_processor(),
+                batch_map_fn=self.get_batch_processor(),
+                rank_idx=rank,
+                num_ranks=world_size,
+            )
+        elif dataloader_type == 'single file':
+            PyTorchDataLoader(
+                batch_size=batch_size,
+                path_list=path_list, # type: ignore
+                scanner_type=Scanner.get_subclass(scanner_type),
+                seed=seed,
+                shuffle=shuffle,
+                pre_fetch_factor=prefetch_factor,
+                num_workers=num_workers,
+                num_ranks=world_size,
+                rank_idx=rank,
+                collate_fn=self.get_collate_fn(),
+                drop_last=False
+            )
+        else:
+            raise ValueError(f'Unknown dataloader type: {dataloader_type}')
 
         return self._eval_dataloader
 
@@ -172,6 +216,9 @@ class TaskBase(Conf, SubclassTracer):
         return None
 
     def get_batch_processor(self) -> Callable[[Batch], Batch] | None:
+        return None
+
+    def get_collate_fn(self) -> Callable[[list[Row]], Batch] | None:
         return None
 
 
@@ -230,7 +277,7 @@ class Tasks(Conf):
         num_workers: int,
         rank: int,
         world_size: int
-    ) -> list[DataLoader | None]:
+    ) -> list[DataLoader | None | PyTorchDataLoader]:
         return [
             task.conf._get_train_dataloader(
                 batch_size=batch_size,
@@ -261,7 +308,7 @@ class Tasks(Conf):
         num_workers: int,
         rank: int,
         world_size: int
-    ) -> list[DataLoader | None]:
+    ) -> list[DataLoader | None | PyTorchDataLoader]:
         return [
             task.conf._get_eval_dataloader(
                 batch_size=batch_size,
