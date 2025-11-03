@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "LMFuser"
-version = "0.0.5"
+version = "0.0.6"
 requires-python = ">= 3.11"
 description = "The LMFuser training framework."
 readme = "README.md"
@@ -20,7 +20,7 @@ dependencies = [
   "pandas",
   "pyarrow",
   "torch",
-  "LMFuser-data>=0.1.0",
+  "LMFuser-data>=0.1.1",
   "tqdm",
   "wandb",
   "HyperArgs>=0.1.3",

@@ -100,7 +100,7 @@ class TaskBase(Conf, SubclassTracer):
                 num_ranks=world_size,
             )
         elif dataloader_type == 'single file':
-            PyTorchDataLoader(
+            self._train_dataloader = PyTorchDataLoader(
                 batch_size=batch_size,
                 path_list=path_list, # type: ignore
                 scanner_type=Scanner.get_subclass(scanner_type),
@@ -168,7 +168,7 @@ class TaskBase(Conf, SubclassTracer):
                 num_ranks=world_size,
             )
         elif dataloader_type == 'single file':
-            PyTorchDataLoader(
+            self._eval_dataloader = PyTorchDataLoader(
                 batch_size=batch_size,
                 path_list=path_list, # type: ignore
                 scanner_type=Scanner.get_subclass(scanner_type),
