@@ -257,11 +257,11 @@ class Tasks(Conf):
 
         if len(self.tasks) > num:
             self.tasks = self.tasks[:num]
-            self.task_weight = self.task_weight[:num]
+            self.task_weights = self.task_weights[:num]
         elif len(self.tasks) < num:
             self.tasks += [TaskSelector() for _ in range(num - len(self.tasks))]
-            self.task_weight += [
-                FloatArg(1.0, min_value=0.0, max_value=1.0) for _ in range(num - len(self.task_weight))
+            self.task_weights += [
+                FloatArg(1.0, min_value=0.0, max_value=1.0) for _ in range(num - len(self.task_weights))
             ]
 
     def get_train_dataloaders(
