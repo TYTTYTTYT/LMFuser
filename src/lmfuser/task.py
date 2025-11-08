@@ -1,5 +1,5 @@
 from typing import Any, Callable
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 import torch
 from torch import nn
@@ -11,6 +11,26 @@ from hyperargs import Conf, StrArg, FloatArg, IntArg, OptionArg, add_dependency,
 
 def scanner_type_list() -> list[str]:
     return list(Scanner.all_subclass_names())
+
+
+class EmptyDataLoader:
+    '''
+        EmptyDataLoader is a class that provides empty data for running with no data requierment.
+    '''
+    def __init__(self, init_step: int = 0) -> None:
+        self.init_step = init_step
+
+    @property
+    def epoch(self) -> int:
+        return 0
+
+    def __iter__(self) -> Iterator[Batch]:
+        def it_wrap() -> Iterator[Batch]:
+            while True:
+                yield {'step': torch.tensor(self.init_step)}
+                self.init_step += 1
+        return it_wrap()
+
 
 @add_dependency('num_train_data_path', 'train_data_path_list')
 @add_dependency('num_train_data_path', 'train_data_weights')
@@ -25,11 +45,11 @@ class TaskBase(Conf, SubclassTracer):
 
     scanner_type = OptionArg(default='C4Scanner', option_fn=scanner_type_list)
 
-    train_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded'])
-    eval_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded'])
+    train_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded', 'empty'])
+    eval_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded', 'empty'])
 
-    _train_dataloader: DataLoader | None | PyTorchDataLoader = None
-    _eval_dataloader: DataLoader | None | PyTorchDataLoader = None
+    _train_dataloader: DataLoader | None | PyTorchDataLoader | EmptyDataLoader = None
+    _eval_dataloader: DataLoader | None | PyTorchDataLoader | EmptyDataLoader = None
 
     @monitor_on('num_train_data_path')
     def set_train_path_list(self) -> None:
@@ -66,7 +86,7 @@ class TaskBase(Conf, SubclassTracer):
         num_workers: int,
         rank: int,
         world_size: int
-    ) -> None | DataLoader | PyTorchDataLoader:
+    ) -> None | DataLoader | PyTorchDataLoader | EmptyDataLoader:
         if self.num_train_data_path.value() == 0:
             return None
         if self._train_dataloader is not None:
@@ -113,6 +133,8 @@ class TaskBase(Conf, SubclassTracer):
                 collate_fn=self.get_collate_fn(),
                 drop_last=False
             )
+        elif dataloader_type == 'empty':
+            self._train_dataloader = EmptyDataLoader(init_step=0)
         else:
             raise ValueError(f'Unknown dataloader type: {dataloader_type}')
 
@@ -131,7 +153,7 @@ class TaskBase(Conf, SubclassTracer):
         num_workers: int,
         rank: int,
         world_size: int
-    ) -> None | DataLoader | PyTorchDataLoader:
+    ) -> None | DataLoader | PyTorchDataLoader | EmptyDataLoader:
         if self.num_eval_data_path.value() == 0:
             return None
         if self._eval_dataloader is not None:
@@ -181,6 +203,8 @@ class TaskBase(Conf, SubclassTracer):
                 collate_fn=self.get_collate_fn(),
                 drop_last=False
             )
+        elif dataloader_type == 'empty':
+            self._eval_dataloader = EmptyDataLoader(init_step=0)
         else:
             raise ValueError(f'Unknown dataloader type: {dataloader_type}')
 
@@ -277,7 +301,7 @@ class Tasks(Conf):
         num_workers: int,
         rank: int,
         world_size: int
-    ) -> list[DataLoader | None | PyTorchDataLoader]:
+    ) -> list[DataLoader | None | PyTorchDataLoader | EmptyDataLoader]:
         return [
             task.conf._get_train_dataloader(
                 batch_size=batch_size,
@@ -308,7 +332,7 @@ class Tasks(Conf):
         num_workers: int,
         rank: int,
         world_size: int
-    ) -> list[DataLoader | None | PyTorchDataLoader]:
+    ) -> list[DataLoader | None | PyTorchDataLoader | EmptyDataLoader]:
         return [
             task.conf._get_eval_dataloader(
                 batch_size=batch_size,
