@@ -25,7 +25,11 @@ class Runner(ABC, Generic[ConfType]):
 
     @abstractmethod
     def eval(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError('train method not implemented')
+        raise NotImplementedError('eval method not implemented')
+
+    @abstractmethod
+    def test(self, *args: Any, **kwargs: Any) -> None:
+        raise NotImplementedError('test method not implemented')
 
     @abstractmethod
     def produce(self, *args: Any, **kwargs: Any) -> None:

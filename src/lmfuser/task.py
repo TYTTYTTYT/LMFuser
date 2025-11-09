@@ -34,6 +34,10 @@ class EmptyDataLoader:
 
 @add_dependency('num_train_data_path', 'train_data_path_list')
 @add_dependency('num_train_data_path', 'train_data_weights')
+@add_dependency('num_eval_data_path', 'eval_data_path_list')
+@add_dependency('num_eval_data_path', 'eval_data_weights')
+@add_dependency('num_test_data_path', 'test_data_path_list')
+@add_dependency('num_test_data_path', 'test_data_weights')
 class TaskBase(Conf, SubclassTracer):
     num_train_data_path = IntArg(1, min_value=0)
     train_data_path_list = [StrArg('Enther the path to the data file.')]
@@ -43,13 +47,19 @@ class TaskBase(Conf, SubclassTracer):
     eval_data_path_list = [StrArg('Enther the path to the data file.')]
     eval_data_weights = [FloatArg(1.0, min_value=0.0, max_value=1.0)]
 
+    num_test_data_path = IntArg(0, min_value=0)
+    test_data_path_list: list[StrArg] = []
+    test_data_weights: list[FloatArg] = []
+
     scanner_type = OptionArg(default='C4Scanner', option_fn=scanner_type_list)
 
     train_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded', 'empty'])
     eval_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded', 'empty'])
+    test_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded', 'empty'])
 
     _train_dataloader: DataLoader | None | PyTorchDataLoader | EmptyDataLoader = None
     _eval_dataloader: DataLoader | None | PyTorchDataLoader | EmptyDataLoader = None
+    _test_dataloader: DataLoader | None | PyTorchDataLoader | EmptyDataLoader = None
 
     @monitor_on('num_train_data_path')
     def set_train_path_list(self) -> None:
@@ -70,8 +80,19 @@ class TaskBase(Conf, SubclassTracer):
             self.eval_data_path_list = self.eval_data_path_list[:num]
             self.eval_data_weights = self.eval_data_weights[:num]
         elif len(self.eval_data_path_list) < num:
-            self.eval_data_path_list += [StrArg('Enther the path to the data file.')] * (num - len(self.train_data_path_list))
-            self.eval_data_weights += [FloatArg(1.0, min_value=0.0, max_value=1.0)] * (num - len(self.train_data_weights))
+            self.eval_data_path_list += [StrArg('Enther the path to the data file.')] * (num - len(self.eval_data_path_list))
+            self.eval_data_weights += [FloatArg(1.0, min_value=0.0, max_value=1.0)] * (num - len(self.eval_data_weights))
+
+    @monitor_on('num_test_data_path')
+    def set_test_path_list(self) -> None:
+        num = self.num_test_data_path.value()
+        assert isinstance(num, int)
+        if len(self.test_data_path_list) > num:
+            self.test_data_path_list = self.test_data_path_list[:num]
+            self.test_data_path_list = self.test_data_path_list[:num]
+        elif len(self.test_data_path_list) < num:
+            self.test_data_path_list += [StrArg('Enther the path to the data file.')] * (num - len(self.test_data_path_list))
+            self.test_data_weights += [FloatArg(1.0, min_value=0.0, max_value=1.0)] * (num - len(self.test_data_weights))
 
     def _get_train_dataloader(
         self,
@@ -210,6 +231,76 @@ class TaskBase(Conf, SubclassTracer):
 
         return self._eval_dataloader
 
+    def _get_test_dataloader(
+        self,
+        batch_size: int,
+        seed: int,
+        shuffle: bool,
+        prefetch_factor: int,
+        ignore_error: bool,
+        qps: float | None,
+        instruct_timeout: float,
+        worker_timeout: float,
+        num_workers: int,
+        rank: int,
+        world_size: int
+    ) -> None | DataLoader | PyTorchDataLoader | EmptyDataLoader:
+        if self.num_test_data_path.value() == 0:
+            return None
+        if self._test_dataloader is not None:
+            return self._test_dataloader
+        path_list = [p.value() for p in self.test_data_path_list]
+        weight_list = [w.value() for w in self.test_data_weights]
+        scanner_type = self.scanner_type.value()
+        assert scanner_type is not None, 'scanner_type is None'
+
+        dataloader_type = self.test_dataloader_type.value()
+        assert dataloader_type is not None, 'dataloader_type is None'
+
+        dataloader_type = self.test_dataloader_type.value()
+        assert dataloader_type in ('sharded', 'single file'), f'Unknown dataloader type: {dataloader_type}'
+
+        if dataloader_type == 'sharded':
+            self._test_dataloader = DataLoader(
+                batch_size=batch_size,
+                path_list=path_list, # type: ignore
+                distributor_weights=weight_list, # type: ignore
+                scanner_type=Scanner.get_subclass(scanner_type),
+                seed=seed,
+                shuffle=shuffle,
+                pre_fetch_factor=prefetch_factor,
+                ignore_error=ignore_error,
+                qps=qps,
+                instruct_timeout=instruct_timeout,
+                worker_timeout=worker_timeout,
+                num_workers=num_workers,
+                map_fn=self.get_row_processor(),
+                flow_fn=self.get_flow_processor(),
+                batch_map_fn=self.get_batch_processor(),
+                rank_idx=rank,
+                num_ranks=world_size,
+            )
+        elif dataloader_type == 'single file':
+            self._test_dataloader = PyTorchDataLoader(
+                batch_size=batch_size,
+                path_list=path_list, # type: ignore
+                scanner_type=Scanner.get_subclass(scanner_type),
+                seed=seed,
+                shuffle=shuffle,
+                pre_fetch_factor=prefetch_factor,
+                num_workers=num_workers,
+                num_ranks=world_size,
+                rank_idx=rank,
+                collate_fn=self.get_collate_fn(),
+                drop_last=False
+            )
+        elif dataloader_type == 'empty':
+            self._test_dataloader = EmptyDataLoader(init_step=0)
+        else:
+            raise ValueError(f'Unknown dataloader type: {dataloader_type}')
+
+        return self._test_dataloader
+
     def train_step(
         self, model: nn.Module,
         batch: Batch,
@@ -232,6 +323,17 @@ class TaskBase(Conf, SubclassTracer):
 
     def cal_dev_metric(self, eval_outputs: dict[str, list[Any]]) -> dict[str, Any]:
         raise NotImplementedError('Please implement this method in child class')
+
+    def set_test_model_path(self, checkpoints_path: str, dev_metrics: dict[str, list[dict[str, Any]]]) -> str | int | None:
+        '''Set the path of the test model based on the dev metrics.
+        Args:
+            checkpoints_path (str): The path to the checkpoints directory.
+            dev_metrics (dict[str, list[dict[str, Any]]]): The development metrics for each task.
+
+        Returns:
+            str | int | None: The path or the checkpoint step to the test model, or None to use the last step model.
+        '''
+        return None
 
     def get_row_processor(self) -> Callable[[Row], Row] | None:
         return None
@@ -350,9 +452,33 @@ class Tasks(Conf):
             for task in self.tasks
         ]
 
-if __name__ == '__main__':
-    class TaskTemp(Task):
-        pass
-
-    conf = Tasks.parse_command_line()
-    print(conf)
+    def get_test_dataloaders(
+        self,
+        batch_size: int,
+        seed: int,
+        shuffle: bool,
+        prefetch_factor: int,
+        ignore_error: bool,
+        qps: float | None,
+        instruct_timeout: float,
+        worker_timeout: float,
+        num_workers: int,
+        rank: int,
+        world_size: int
+    ) -> list[DataLoader | None | PyTorchDataLoader | EmptyDataLoader]:
+        return [
+            task.conf._get_test_dataloader(
+                batch_size=batch_size,
+                seed=seed,
+                shuffle=shuffle,
+                prefetch_factor=prefetch_factor,
+                ignore_error=ignore_error,
+                qps=qps,
+                instruct_timeout=instruct_timeout,
+                worker_timeout=worker_timeout,
+                num_workers=num_workers,
+                rank=rank,
+                world_size=world_size,
+            )
+            for task in self.tasks
+        ]

@@ -190,6 +190,20 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             rank=get_global_rank(),
         )
 
+        self.test_data_loaders = config.task_conf.get_test_dataloaders(
+            batch_size=config.sub_batch_size.value(), # type: ignore
+            seed=config.seed.value(), # type: ignore
+            shuffle=config.shuffle_dataset.value(), # type: ignore
+            prefetch_factor=config.row_prefetch.value(), # type: ignore
+            num_workers=config.num_row_workers.value(), # type: ignore
+            ignore_error=config.ignore_data_error.value(), # type: ignore
+            qps=config.data_row_qps.value(),
+            instruct_timeout=config.instruct_timeout.value(), # type: ignore
+            worker_timeout=config.worker_timeout.value(), # type: ignore
+            world_size=get_world_size(),
+            rank=get_global_rank(),
+        )
+
         self.train_task_idxs: list[int] = []
         for idx, loader in enumerate(self.train_data_loaders):
             if loader is not None:
@@ -200,6 +214,11 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             if loader is not None:
                 self.eval_task_idxs.append(idx)
 
+        self.test_task_idxs: list[int] = []
+        for idx, loader in enumerate(self.test_data_loaders):
+            if loader is not None:
+                self.test_task_idxs.append(idx)
+
         assert len(self.train_task_idxs) + len(self.eval_task_idxs) > 0, 'At least one train or eval task must be provided.'
 
         self.task_weights: list[float] = [w.value() for w in config.task_conf.task_weights] # type: ignore
@@ -209,6 +228,9 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         self.train_iters = [iter(loader) if loader is not None else None for loader in self.train_data_loaders]
         self.eval_iters = [iter(loader) if loader is not None else None for loader in self.eval_data_loaders]
+
+        self._all_eval_results: dict[str, list[dict[str, Any]]] = {}
+        self._test_results: dict[str, dict[str, Any]] = {}
 
     def sample_train_task_id(self) -> int:
         '''
@@ -261,6 +283,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 logger.critical(f'casting model to fp16')
                 model = model.half()
             self._model = DDPWraper(model)
+        assert self._model is not None
         return self._model
 
     def _should_stop(self) -> bool:
@@ -550,7 +573,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 dataloader,
                 dynamic_ncols=True,
                 desc=f'evaluating task {task.__class__.__name__}',
-                position=2,
+                position=3,
                 disable=True if get_global_rank() != 0 else False,
                 leave=False,
                 unit='batch'
@@ -577,6 +600,64 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         for k, v in metrics.items():
             self.step_log({f'{task.__class__.__name__}/dev/{k}': v})
 
+        if task.__class__.__name__ not in self._all_eval_results:
+            self._all_eval_results[task.__class__.__name__] = []
+        self._all_eval_results[task.__class__.__name__].append({'step': self.step, 'metrics': metrics})
+
+    def _test_one_task(self, task_id: int, **kwargs: Any) -> None:
+        os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
+        dataloader = self.test_data_loaders[task_id]
+        task = self.tasks[task_id]
+
+        ckpt_path = self.config.checkpoint_directory.value()
+        assert ckpt_path is not None
+        test_model_path = task.set_test_model_path(ckpt_path, self._all_eval_results)
+        if test_model_path is not None:
+            if isinstance(test_model_path, int):
+                test_model_path = Path(ckpt_path) / str(test_model_path)
+            
+            self.model_loader.model_path = test_model_path
+            self._model = None
+
+        batch_list: list[dict[str, list[Any]]] = []
+        with ExitStack() as stack:
+            stack.enter_context(torch.no_grad())
+            if get_world_size() > 1:
+                stack.enter_context(self.model.model.no_sync())
+            for batch in tqdm(
+                dataloader,
+                dynamic_ncols=True,
+                desc=f'testing task {task.__class__.__name__}',
+                position=4,
+                disable=True if get_global_rank() != 0 else False,
+                leave=False,
+                unit='batch'
+            ):
+                result = task.eval_step(
+                    self.model, # type: ignore
+                    self._batch_to_device(batch),
+                    self.step,
+                    get_default_device()
+                )
+                batch_list.append(result)
+
+            if len(batch_list) == 0:
+                raise RuntimeError(f'No test data found in rank {get_global_rank()} '
+                                f'for task {task.__class__.__name__}')
+            cat_result = batch_list[0]
+            for batch in batch_list[1:]:
+                for k, v in batch.items():
+                    cat_result[k] += v
+        all_result = batch_all_gather(cat_result)
+
+        with torch.no_grad():
+            metrics = task.cal_dev_metric(all_result)
+        for k, v in metrics.items():
+            self.step_log({f'{task.__class__.__name__}/test/{k}': v})
+
+        self._test_results[task.__class__.__name__] = {'step': self.step, 'metrics': metrics}
+
     def eval(self, *args: Any, **kwargs: Any) -> None:
         for task_id in tqdm(
             self.eval_task_idxs, 
@@ -588,6 +669,48 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             unit='task'
         ):
             self._eval_one_task(task_id)
+
+        if get_global_rank() != 0:
+            return
+        ckpt_path = self.config.checkpoint_directory.value()
+        assert ckpt_path is not None
+        try:
+            eval_results = json.dumps(self._all_eval_results, indent=2)
+            ckpt_dir = Path(ckpt_path)
+            if not ckpt_dir.exists():
+                ckpt_dir.mkdir(parents=True)
+            eval_path = ckpt_dir / 'eval_results.json'
+            with open(eval_path, 'w') as f:
+                f.write(eval_results)
+        except:
+            logger.warning(f'Failed to save eval results to {ckpt_path}')
+
+    def test(self, *args: Any, **kwargs: Any) -> None:
+        for task_id in tqdm(
+            self.test_task_idxs,
+            dynamic_ncols=True, 
+            desc=f'testing {len(self.test_task_idxs)} tasks...',
+            position=3,
+            disable=True if get_global_rank() != 0 else False,
+            leave=False,
+            unit='task'
+        ):
+            self._test_one_task(task_id)
+
+        if get_global_rank() != 0:
+            return
+        ckpt_path = self.config.checkpoint_directory.value()
+        assert ckpt_path is not None
+        try:
+            test_results = json.dumps(self._test_results, indent=2)
+            ckpt_dir = Path(ckpt_path)
+            if not ckpt_dir.exists():
+                ckpt_dir.mkdir(parents=True)
+            test_path = ckpt_dir / 'test_results.json'
+            with open(test_path, 'w') as f:
+                f.write(test_results)
+        except:
+            logger.warning(f'Failed to save test results to {ckpt_path}')
 
     def produce(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError('produce method not implemented')
