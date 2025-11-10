@@ -369,7 +369,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         try:
             return next(it)
         except StopIteration:
-            self.train_iters[task_idx] = iter(self.train_data_loaders[task_idx]) # type: ignore
+            it = iter(self.train_data_loaders[task_idx]) # type: ignore
+            self.train_iters[task_idx] = it
             return next(it)
 
     @property
