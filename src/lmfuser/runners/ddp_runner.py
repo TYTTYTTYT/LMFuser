@@ -557,6 +557,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self._one_train_step()
             self._pbar_train.update(1)
 
+        self.test()
         self._pbar_train.close()
 
     def _eval_one_task(self, task_id: int, **kwargs: Any) -> None:
