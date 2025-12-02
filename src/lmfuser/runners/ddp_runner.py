@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Any, Iterator, TypeVar, Generic, Union, Hashable, List, Iterable
+from typing import Any, TypeVar, Union, Hashable, List
 from contextlib import ExitStack
 from collections import defaultdict
 import logging
@@ -30,7 +30,7 @@ from lmfuser_data.interfaces import Batch
 import wandb
 from wandb.wandb_run import Run
 
-from ..task import Task, Tasks
+from ..task import Tasks
 from ..utils import (
     get_global_rank,
     get_local_rank,
@@ -46,7 +46,7 @@ from ..utils import (
 
 from ..optimizers import OptimizerConfig
 from ..schedulers import LRSchedulerConfig
-from ..model_loader import ModelLoader, ModelLoaderConf
+from ..model_loader import ModelLoaderConf
 from .runner import RunerConf, Runner
 
 logger = logging.getLogger(__name__)
@@ -106,7 +106,7 @@ class DDPRunnerConfig(RunerConf):
     lr_scheduler: LRSchedulerConfig = LRSchedulerConfig()
 
     dp_type = OptionArg(default='ddp', options=['ddp'])
-    model_precision = OptionArg(options=['fp32', 'fp16'], default='fp32')
+    model_precision = OptionArg(options=['fp32', 'fp16', 'bf16'], default='fp32')
     use_amp = BoolArg(default=False)
     amp_precision = OptionArg(options=['fp16', 'bf16'], default='fp16')
     seed = IntArg(42)
@@ -128,6 +128,8 @@ class DDPRunnerConfig(RunerConf):
             return torch.float32
         elif self.model_precision == 'fp16':
             return torch.float16
+        elif self.model_precision == 'bf16':
+            return torch.bfloat16
         else:
             raise ValueError(self.model_precision)
 
@@ -282,6 +284,9 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             if self.config.model_precision.value() == 'fp16':
                 logger.critical(f'casting model to fp16')
                 model = model.half()
+            elif self.config.model_precision.value() == 'bf16':
+                logger.critical(f'casting model to bf16')
+                model = model.bfloat16()
             self._model = DDPWraper(model)
         assert self._model is not None
         return self._model
@@ -310,6 +315,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                         v = v.to(torch.float32) if v.dtype != torch.float32 else v
                     elif precision == 'fp16':
                         v = v.to(torch.float16) if v.dtype != torch.float16 else v
+                    elif precision == 'bf16':
+                        v = v.to(torch.bfloat16) if v.dtype != torch.bfloat16 else v
                     else:
                         raise ValueError(f'Unknown model precision "{precision}"')
                 assert isinstance(batch, dict)
