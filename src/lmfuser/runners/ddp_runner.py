@@ -551,18 +551,41 @@ class DDPRunner(Runner[DDPRunnerConfig]):
     def train(self, *args: Any, **kwargs: Any) -> None:
         self._prepare_train()
 
-        self._pbar_train = tqdm(
-            total=self.config.total_step.value(),
-            position=0,
-            initial=self.step - 1,
-            dynamic_ncols=True,
-            unit='step',
-            disable=True if get_global_rank() != 0 else False
-        )
+        self._last_epoch = self.epoch
+        stop_metric = self.config.stop_by.value()
+        assert stop_metric in ('step', 'epoch')
+        if stop_metric == 'step':
+            self._pbar_train = tqdm(
+                total=self.config.total_step.value(),
+                position=0,
+                initial=self.step - 1,
+                dynamic_ncols=True,
+                unit='step',
+                disable=True if get_global_rank() != 0 else False
+            )
+        elif stop_metric == 'epoch':
+            self._pbar_train = tqdm(
+                total=self.config.total_epoch.value(),
+                position=0,
+                initial=self.step - 1,
+                dynamic_ncols=True,
+                unit='epoch',
+                disable=True if get_global_rank() != 0 else False
+            )
+        else:
+            raise ValueError(f'Unknown stop metric: {stop_metric}. Please choose from "step" and "epoch".')
 
         while not self._should_stop():
             self._one_train_step()
-            self._pbar_train.update(1)
+            if stop_metric == 'step':
+                self._pbar_train.update(1)
+            elif stop_metric == 'epoch':
+                current_epoch = self.epoch
+                if current_epoch > self._last_epoch:
+                    self._last_epoch = self.epoch
+                    self._pbar_train.update(1)
+            else:
+                raise ValueError(f'Unknown stop metric: {stop_metric}. Please choose from "step" and "epoch".')
 
         self.test()
         self._pbar_train.close()
