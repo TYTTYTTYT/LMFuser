@@ -24,7 +24,12 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import Optimizer
 from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict, 
+    StateDictOptions, 
+    get_optimizer_state_dict,
+    set_optimizer_state_dict
+)
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from tqdm import tqdm
 from hyperargs import Conf, StrArg, IntArg, FloatArg, OptionArg, BoolArg
@@ -41,8 +46,6 @@ from ..utils import (
     dist_init,
     dist_avg,
     batch_all_gather,
-    gather_object,
-    cal_acc_num,
     get_default_device_type
 )
 
@@ -84,6 +87,24 @@ class DDPWraper(nn.Module):
             return super().__getattr__(name)
         except:
             return self.model.module.__getattr__(name)
+
+
+class FSDP2Wrapper(nn.Module):
+    def __init__(self, model: FSDPModule) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.model(*args, **kwargs) # type: ignore
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except:
+            return self.model.__getattribute__(name)
+
+    def __call__(self, *args: Any, **kwds: Any) -> Any:
+        return self.model(*args, **kwds) # type: ignore
 
 
 class DDPRunnerConfig(RunerConf):
@@ -284,27 +305,52 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         else:
             raise ValueError(f'dp_type must be either "ddp" or "fsdp2", got "{self.dp_type}" instead.')
 
-    def save(self, model: nn.Module, directory: str, step: int, **kwargs: Any) -> None:
-        path = Path(directory) / str(step)
-        os.makedirs(path, exist_ok=True)
-        self.model_loader.save_model(model, path)
+    def save(self, directory: str | os.PathLike, *args, **kwargs) -> None:
+        if isinstance(self.model, (DDPWraper, Wrapper)):
+            model = self.model.model.module
+            optim_states = self.optimizer.state_dict()
+        elif isinstance(self.model, FSDP2Wrapper):                    
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            full_states = get_model_state_dict(
+                self.model.model, # type: ignore
+                options=options
+            )
+            if get_global_rank() == 0:
+                model = self.model_loader.load_model()
+                model.load_state_dict(full_states)
 
-        optimizer_path = path / 'optimizer.pt'
-        torch.save(self.optimizer.state_dict(), optimizer_path)
+            optim_states = get_optimizer_state_dict(
+                model=self.model, # type: ignore
+                optimizers=self.optimizer,
+                options=StateDictOptions(
+                    full_state_dict=True,
+                    cpu_offload=True,
+                )
+            )
+        else:
+            raise ValueError(f'Unknown model type {type(self.model)}')
+        
+        if get_global_rank() == 0:
+            path = Path(directory) / str(self.step)
+            os.makedirs(path, exist_ok=True)
+            self.model_loader.save_model(model, path) # type: ignore
 
-        scheduler_path = path / 'scheduler.pt'
-        torch.save(self.scheduler.state_dict(), scheduler_path)
+            optimizer_path = path / 'optimizer.pt'
+            torch.save(optim_states, optimizer_path)
 
-        runner_path = path / 'runner.json'
-        with open(runner_path, 'w') as f:
-            f.write(json.dumps({
-                'step': step + 1,
-                'epoch': self.epoch,
-                'config': self.config.to_dict(),
-            }, indent=4))
+            scheduler_path = path / 'scheduler.pt'
+            torch.save(self.scheduler.state_dict(), scheduler_path)
+
+            runner_path = path / 'runner.json'
+            with open(runner_path, 'w') as f:
+                f.write(json.dumps({
+                    'step': self.step + 1,
+                    'epoch': self.epoch,
+                    'config': self.config.to_dict(),
+                }, indent=4))
 
     @property
-    def model(self) -> DDPWraper | FSDPModule:
+    def model(self) -> DDPWraper | FSDP2Wrapper:
         model = getattr(self, '_model', None)
         if model is None:
             model = self.load_model()
@@ -318,7 +364,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 model = model.float() # type: ignore
             if isinstance(model, FSDPModule):
                 logger.critical(f'wrapping model with FSDPModule')
-                self._model = model
+                self._model = FSDP2Wrapper(model)
             else:
                 logger.critical(f'wrapping model with DDPWraper')
                 self._model = DDPWraper(model)
@@ -371,11 +417,24 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         else:
             self.optimizer = optimizer
         if hasattr(self, '_optimizer_states'):
-            self.optimizer.load_state_dict(self._optimizer_states)
-            for state in self.optimizer.state.values():
-                for k, v in state.items():
-                    if torch.is_tensor(v):
-                        state[k] = v.to(get_default_device(), non_blocking=True)
+            if isinstance(self.model, (DDPWraper, Wrapper)):
+                self.optimizer.load_state_dict(self._optimizer_states)
+                for state in self.optimizer.state.values():
+                    for k, v in state.items():
+                        if torch.is_tensor(v):
+                            state[k] = v.to(get_default_device(), non_blocking=True)
+            elif isinstance(self.model, FSDP2Wrapper):
+                set_optimizer_state_dict(
+                    model=self.model.model, # type: ignore
+                    optimizers=self.optimizer,
+                    optim_state_dict=self._optimizer_states,
+                    options=StateDictOptions(
+                        full_state_dict=True,
+                        broadcast_from_rank0=True,
+                    ),
+                )
+            else:
+                raise ValueError(f'Unknown model type "{type(self.model)}"')
 
         if scheduler is None:
             self.scheduler = self.config.lr_scheduler.init_lr_scheduler(
@@ -448,6 +507,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
     def _one_train_step(self, **kwargs: Any) -> None:
         # clean the gradients
         self.optimizer.zero_grad()
+        self.model.train() # type: ignore
 
         # select a task to run in this step
         task_id = self.sample_train_task_id()
@@ -470,9 +530,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                         }[amp_selection],
                     ))
 
+                # check whether the last acc step
+                if acc_idx != self.config._num_acc_steps - 1:
+                    if isinstance(self.model, (DDPWraper, Wrapper)):
+                        stack.enter_context(self.model.model.no_sync())
+                    elif isinstance(self.model, FSDP2Wrapper):
+                        self.model.set_requires_gradient_sync(False, recurse=True)
+                else:
+                    if isinstance(self.model, FSDP2Wrapper):
+                        self.model.set_requires_gradient_sync(True, recurse=True)
+
                 # compute loss for each sub_batch
-                # if isinstance(self.model, FSDPModule):
-                #     self.model.unshard()
                 subbatch_result = task.train_step(
                     model=self.model, # type: ignore
                     batch=self._batch_to_device(self._next_train_batch(task_id)),
@@ -562,30 +630,11 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         save_step_freq = self.config.save_step_freq.value()
         assert save_step_freq is not None
         if self.step % save_step_freq == 0:
-            logger.info('begin to save the model') if get_global_rank() == 0 else ...
             self._pbar_train.set_description('begin to save the model', True)
-            if isinstance(self.model, (DDPWraper, Wrapper)):
-                to_save = self.model.model.module
-            elif isinstance(self.model, FSDPModule):                    
-                options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-                full_states = get_model_state_dict(
-                    self.model, # type: ignore
-                    options=options
-                )
-                print(list(full_states.keys()))
-                if get_global_rank() == 0:
-                    to_save = self.model_loader.load_model()
-                    to_save.load_state_dict(full_states)
             ckpt_path = self.config.checkpoint_directory.value()
             assert ckpt_path is not None
-            if get_global_rank() == 0:
-                self.save(
-                    to_save,  # type: ignore
-                    ckpt_path,
-                    self.step
-                )
-                logger.info('model saved!')
-                self._pbar_train.set_description('model saved!', True)
+            self.save(ckpt_path)
+            self._pbar_train.set_description('model saved!', True)
         torch.distributed.barrier() if get_world_size() > 1 else ...
 
         eval_step_freq = self.config.eval_step_freq.value()
@@ -615,7 +664,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self._pbar_train = tqdm(
                 total=self.config.total_epoch.value(),
                 position=0,
-                initial=self.step - 1,
+                initial=self.epoch,
                 dynamic_ncols=True,
                 unit='epoch',
                 disable=True if get_global_rank() != 0 else False
@@ -640,6 +689,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
     def _eval_one_task(self, task_id: int, **kwargs: Any) -> None:
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+        self.model.eval()
 
         dataloader = self.eval_data_loaders[task_id]
         task = self.tasks[task_id]
@@ -691,6 +741,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
     def _test_one_task(self, task_id: int, **kwargs: Any) -> None:
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+        self.model.eval() # type: ignore
 
         dataloader = self.test_data_loaders[task_id]
         task = self.tasks[task_id]
@@ -806,6 +857,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         raise NotImplementedError('produce method not implemented')
 
     def load(self, directory: str | os.PathLike, *args, **kwargs) -> None:
+        self._model = None
         self.model_loader.model_path = directory
 
         optimizer_path = Path(directory) / 'optimizer.pt'

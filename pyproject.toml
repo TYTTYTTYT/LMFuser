@@ -19,7 +19,7 @@ dependencies = [
   "numpy",
   "pandas",
   "pyarrow",
-  "torch",
+  "torch>=2.4.0",
   "LMFuser-data>=0.1.1",
   "tqdm",
   "wandb",
