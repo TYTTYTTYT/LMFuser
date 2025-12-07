@@ -20,10 +20,17 @@ except ImportError:
     from torch.cuda.amp.grad_scaler import GradScaler
     OLD_GRADSCALER = True
 from torch.amp.autocast_mode import autocast
-from torch.nn.utils.clip_grad import clip_grad_norm_
+from torch.nn.utils import clip_grad_norm_
 from torch.optim import Optimizer
 from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict, 
+    StateDictOptions, 
+    get_optimizer_state_dict,
+    set_optimizer_state_dict
+)
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from tqdm import tqdm
 from hyperargs import Conf, StrArg, IntArg, FloatArg, OptionArg, BoolArg
 from lmfuser_data.interfaces import Batch
@@ -39,8 +46,6 @@ from ..utils import (
     dist_init,
     dist_avg,
     batch_all_gather,
-    gather_object,
-    cal_acc_num,
     get_default_device_type
 )
 
@@ -84,6 +89,24 @@ class DDPWraper(nn.Module):
             return self.model.module.__getattr__(name)
 
 
+class FSDP2Wrapper(nn.Module):
+    def __init__(self, model: FSDPModule) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.model(*args, **kwargs) # type: ignore
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except:
+            return self.model.__getattribute__(name)
+
+    def __call__(self, *args: Any, **kwds: Any) -> Any:
+        return self.model(*args, **kwds) # type: ignore
+
+
 class DDPRunnerConfig(RunerConf):
 
     checkpoint_directory = StrArg('please set checkpoint directory here!')
@@ -105,7 +128,7 @@ class DDPRunnerConfig(RunerConf):
     optimizer: OptimizerConfig = OptimizerConfig()
     lr_scheduler: LRSchedulerConfig = LRSchedulerConfig()
 
-    dp_type = OptionArg(default='ddp', options=['ddp'])
+    dp_type = OptionArg(default='ddp', options=['ddp', 'fsdp2'])
     model_precision = OptionArg(options=['fp32', 'fp16', 'bf16'], default='fp32')
     use_amp = BoolArg(default=False)
     amp_precision = OptionArg(options=['fp16', 'bf16'], default='fp16')
@@ -157,6 +180,9 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         self.step = 1
         self.pre_epoch = 0
         self.model_loader = config.model_loader_conf.get_model_loader()
+        dp_type = config.dp_type.value()
+        assert dp_type in ('ddp', 'fsdp2')
+        self.dp_type = dp_type
 
         if config.resume_training.value():
             resume_path = config.resume_path.value()
@@ -254,40 +280,94 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             list(range(len(self.eval_task_idxs))), weights=self.eval_task_weights, k=1
         )[0]
 
-    def load_model(self, **kwargs: Any) -> nn.Module:
-        return self.model_loader.load_model()
+    @property
+    def fsdp_kwargs(self) -> dict:
+        amp_precision = self.config.amp_precision.value()
+        if amp_precision == 'bf16':
+            param_precision = torch.bfloat16
+        elif amp_precision == 'fp16':
+            param_precision = torch.float16
+        else:
+            raise ValueError(f'amp_precision must be either "bf16" or "fp16", got "{amp_precision}" instead.')
 
-    def save(self, model: nn.Module, directory: str, step: int, **kwargs: Any) -> None:
-        path = Path(directory) / str(step)
-        os.makedirs(path, exist_ok=True)
-        self.model_loader.save_model(model, path)
+        return {
+            'mp_policy': MixedPrecisionPolicy(
+                param_dtype=param_precision,
+                reduce_dtype=torch.float32,
+            )
+        }
 
-        optimizer_path = path / 'optimizer.pt'
-        torch.save(self.optimizer.state_dict(), optimizer_path)
+    def load_model(self, **kwargs: Any) -> nn.Module | FSDPModule:
+        if self.dp_type == 'ddp':
+            return self.model_loader.load_model()
+        elif self.dp_type == 'fsdp2':
+            return self.model_loader.load_model_for_fsdp2(self.fsdp_kwargs)
+        else:
+            raise ValueError(f'dp_type must be either "ddp" or "fsdp2", got "{self.dp_type}" instead.')
 
-        scheduler_path = path / 'scheduler.pt'
-        torch.save(self.scheduler.state_dict(), scheduler_path)
+    def save(self, directory: str | os.PathLike, *args, **kwargs) -> None:
+        if isinstance(self.model, (DDPWraper, Wrapper)):
+            model = self.model.model.module
+            optim_states = self.optimizer.state_dict()
+        elif isinstance(self.model, FSDP2Wrapper):                    
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            full_states = get_model_state_dict(
+                self.model.model, # type: ignore
+                options=options
+            )
+            if get_global_rank() == 0:
+                model = self.model_loader.load_model()
+                model.load_state_dict(full_states)
 
-        runner_path = path / 'runner.json'
-        with open(runner_path, 'w') as f:
-            f.write(json.dumps({
-                'step': step + 1,
-                'epoch': self.epoch,
-                'config': self.config.to_dict(),
-            }, indent=4))
+            optim_states = get_optimizer_state_dict(
+                model=self.model, # type: ignore
+                optimizers=self.optimizer,
+                options=StateDictOptions(
+                    full_state_dict=True,
+                    cpu_offload=True,
+                )
+            )
+        else:
+            raise ValueError(f'Unknown model type {type(self.model)}')
+        
+        if get_global_rank() == 0:
+            path = Path(directory) / str(self.step)
+            os.makedirs(path, exist_ok=True)
+            self.model_loader.save_model(model, path) # type: ignore
+
+            optimizer_path = path / 'optimizer.pt'
+            torch.save(optim_states, optimizer_path)
+
+            scheduler_path = path / 'scheduler.pt'
+            torch.save(self.scheduler.state_dict(), scheduler_path)
+
+            runner_path = path / 'runner.json'
+            with open(runner_path, 'w') as f:
+                f.write(json.dumps({
+                    'step': self.step + 1,
+                    'epoch': self.epoch,
+                    'config': self.config.to_dict(),
+                }, indent=4))
 
     @property
-    def model(self) -> DDPWraper:
+    def model(self) -> DDPWraper | FSDP2Wrapper:
         model = getattr(self, '_model', None)
         if model is None:
             model = self.load_model()
             if self.config.model_precision.value() == 'fp16':
                 logger.critical(f'casting model to fp16')
-                model = model.half()
+                model = model.half() # type: ignore
             elif self.config.model_precision.value() == 'bf16':
                 logger.critical(f'casting model to bf16')
-                model = model.bfloat16()
-            self._model = DDPWraper(model)
+                model = model.bfloat16() # type: ignore
+            elif self.config.model_precision.value() == 'fp32':
+                model = model.float() # type: ignore
+            if isinstance(model, FSDPModule):
+                logger.critical(f'wrapping model with FSDPModule')
+                self._model = FSDP2Wrapper(model)
+            else:
+                logger.critical(f'wrapping model with DDPWraper')
+                self._model = DDPWraper(model)
         assert self._model is not None
         return self._model
 
@@ -332,16 +412,29 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
         if optimizer is None:
             self.optimizer = self.config.optimizer.init_optimzier(
-                self.model.parameters()
+                self.model.parameters() # type: ignore
             )
         else:
             self.optimizer = optimizer
         if hasattr(self, '_optimizer_states'):
-            self.optimizer.load_state_dict(self._optimizer_states)
-            for state in self.optimizer.state.values():
-                for k, v in state.items():
-                    if torch.is_tensor(v):
-                        state[k] = v.to(get_default_device(), non_blocking=True)
+            if isinstance(self.model, (DDPWraper, Wrapper)):
+                self.optimizer.load_state_dict(self._optimizer_states)
+                for state in self.optimizer.state.values():
+                    for k, v in state.items():
+                        if torch.is_tensor(v):
+                            state[k] = v.to(get_default_device(), non_blocking=True)
+            elif isinstance(self.model, FSDP2Wrapper):
+                set_optimizer_state_dict(
+                    model=self.model.model, # type: ignore
+                    optimizers=self.optimizer,
+                    optim_state_dict=self._optimizer_states,
+                    options=StateDictOptions(
+                        full_state_dict=True,
+                        broadcast_from_rank0=True,
+                    ),
+                )
+            else:
+                raise ValueError(f'Unknown model type "{type(self.model)}"')
 
         if scheduler is None:
             self.scheduler = self.config.lr_scheduler.init_lr_scheduler(
@@ -364,6 +457,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 self.scaler = GradScaler(enabled=enable_scaler)
             else:
                 self.scaler = GradScaler(device=get_default_device_type(), enabled=enable_scaler) # type: ignore
+                if not enable_scaler:
+                    self.scaler = None
         else:
             self.scaler = scaler
 
@@ -412,6 +507,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
     def _one_train_step(self, **kwargs: Any) -> None:
         # clean the gradients
         self.optimizer.zero_grad()
+        self.model.train() # type: ignore
 
         # select a task to run in this step
         task_id = self.sample_train_task_id()
@@ -434,9 +530,19 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                         }[amp_selection],
                     ))
 
+                # check whether the last acc step
+                if acc_idx != self.config._num_acc_steps - 1:
+                    if isinstance(self.model, (DDPWraper, Wrapper)):
+                        stack.enter_context(self.model.model.no_sync())
+                    elif isinstance(self.model, FSDP2Wrapper):
+                        self.model.set_requires_gradient_sync(False, recurse=True)
+                else:
+                    if isinstance(self.model, FSDP2Wrapper):
+                        self.model.set_requires_gradient_sync(True, recurse=True)
+
                 # compute loss for each sub_batch
                 subbatch_result = task.train_step(
-                    model=self.model,
+                    model=self.model, # type: ignore
                     batch=self._batch_to_device(self._next_train_batch(task_id)),
                     step=self.step, 
                     device=get_local_rank(),
@@ -459,10 +565,10 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                     elif isinstance(v, (list)) and len(v) > 0 and isinstance(v[0], (float, int)):
                         batch_datas[k].extend([float(i) for i in v]) # type: ignore
 
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
         running_loss = dist_avg(running_loss)
         self.step_log({f'{task.__class__.__name__}/train/loss': running_loss})
@@ -482,7 +588,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
             norm = clip_grad_norm_(
-                parameters=self.model.parameters(), 
+                parameters=self.model.parameters(),  # type: ignore
                 max_norm=grad_norm_clip_val
             ).item()
             norm = dist_avg(norm)
@@ -490,7 +596,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         num_hot_params = 0
         num_freeze_params = 0
-        for param in self.model.parameters():
+        for param in self.model.parameters(): # type: ignore
             if param.requires_grad == False:
                 param.grad = None
                 num_freeze_params += param.numel()
@@ -523,20 +629,11 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         save_step_freq = self.config.save_step_freq.value()
         assert save_step_freq is not None
-        if all(
-            [self.step % save_step_freq == 0, get_global_rank() == 0]
-        ):
-            logger.info('begin to save the model')
+        if self.step % save_step_freq == 0:
             self._pbar_train.set_description('begin to save the model', True)
-            to_save = self.model.model.module
             ckpt_path = self.config.checkpoint_directory.value()
             assert ckpt_path is not None
-            self.save(
-                to_save,  # type: ignore
-                ckpt_path,
-                self.step
-            )
-            logger.info('model saved!')
+            self.save(ckpt_path)
             self._pbar_train.set_description('model saved!', True)
         torch.distributed.barrier() if get_world_size() > 1 else ...
 
@@ -567,7 +664,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self._pbar_train = tqdm(
                 total=self.config.total_epoch.value(),
                 position=0,
-                initial=self.step - 1,
+                initial=self.epoch,
                 dynamic_ncols=True,
                 unit='epoch',
                 disable=True if get_global_rank() != 0 else False
@@ -592,6 +689,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
     def _eval_one_task(self, task_id: int, **kwargs: Any) -> None:
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+        self.model.eval()
 
         dataloader = self.eval_data_loaders[task_id]
         task = self.tasks[task_id]
@@ -600,7 +698,10 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         with ExitStack() as stack:
             stack.enter_context(torch.no_grad())
             if get_world_size() > 1:
-                stack.enter_context(self.model.model.no_sync())
+                if isinstance(self.model, (DDPWraper, Wrapper)):
+                    stack.enter_context(self.model.model.no_sync())
+                elif isinstance(self.model, FSDPModule):
+                    self.model.set_requires_gradient_sync(False, recurse=True)
             for batch in tqdm(
                 dataloader,
                 dynamic_ncols=True,
@@ -635,9 +736,12 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         if task.__class__.__name__ not in self._all_eval_results:
             self._all_eval_results[task.__class__.__name__] = []
         self._all_eval_results[task.__class__.__name__].append({'step': self.step, 'metrics': metrics})
+        if isinstance(self.model, FSDPModule):
+            self.model.set_requires_gradient_sync(True, recurse=True)
 
     def _test_one_task(self, task_id: int, **kwargs: Any) -> None:
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+        self.model.eval() # type: ignore
 
         dataloader = self.test_data_loaders[task_id]
         task = self.tasks[task_id]
@@ -656,7 +760,10 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         with ExitStack() as stack:
             stack.enter_context(torch.no_grad())
             if get_world_size() > 1:
-                stack.enter_context(self.model.model.no_sync())
+                if isinstance(self.model, (DDPWraper, Wrapper)):
+                    stack.enter_context(self.model.model.no_sync())
+                elif isinstance(self.model, FSDPModule):
+                    self.model.set_requires_gradient_sync(False, recurse=True)
             for batch in tqdm(
                 dataloader,
                 dynamic_ncols=True,
@@ -689,6 +796,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self.step_log({f'{task.__class__.__name__}/test/{k}': v})
 
         self._test_results[task.__class__.__name__] = {'step': self.step, 'metrics': metrics}
+        if isinstance(self.model, FSDPModule):
+            self.model.set_requires_gradient_sync(True, recurse=True)
 
     def eval(self, *args: Any, **kwargs: Any) -> None:
         for task_id in tqdm(
@@ -748,6 +857,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         raise NotImplementedError('produce method not implemented')
 
     def load(self, directory: str | os.PathLike, *args, **kwargs) -> None:
+        self._model = None
         self.model_loader.model_path = directory
 
         optimizer_path = Path(directory) / 'optimizer.pt'
