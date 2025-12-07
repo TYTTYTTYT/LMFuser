@@ -1,6 +1,7 @@
 from os import PathLike
 
 from torch import nn
+from torch.distributed.fsdp import FSDPModule
 from lmfuser_data.interfaces import SubclassTracer
 from hyperargs import Conf, StrArg, OptionArg
 
@@ -10,6 +11,9 @@ class ModelLoader(SubclassTracer):
         self.model_path = model_path
 
     def load_model(self) -> nn.Module:
+        raise NotImplementedError(f'Not implemented load_model for {self.__class__.__name__}')
+
+    def load_model_for_fsdp2(self, fsdp_kwargs: dict) -> FSDPModule:
         raise NotImplementedError(f'Not implemented load_model for {self.__class__.__name__}')
 
     @classmethod
