@@ -516,6 +516,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         # calculate loss
         running_loss: float = 0.0
         batch_datas: defaultdict[Hashable, List[float]] = defaultdict(list)
+        subbatch_result_lst: list[Batch] = []
         for acc_idx in range(self.config._num_acc_steps):
             with ExitStack() as stack:
                 # check whether to use amp
@@ -554,6 +555,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                     raise KeyError('no loss returned from the batch')
                 assert isinstance(subbatch_result, dict)
                 loss = subbatch_result['loss']
+                del subbatch_result['loss']
+                subbatch_result_lst.append(subbatch_result) # type: ignore
                 assert isinstance(loss, Tensor)
                 loss = loss / self.config._num_acc_steps
                 running_loss += loss.item()
@@ -625,7 +628,19 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             {f'{task.__class__.__name__}/train/learning_rate': current_lr}
         )
         self.scheduler.step()
-        torch.distributed.barrier() if get_world_size() > 1 else ...
+
+        other_step_results = defaultdict(list)
+        for r in subbatch_result_lst:
+            for k, v in r.items():
+                if isinstance(v, (float, int)):
+                    other_step_results[k].append(float(v))
+        all_other_step_results = batch_all_gather(other_step_results)
+        for k, v in all_other_step_results.items():
+            try:
+                avg = sum(v) / len(v)
+            except:
+                continue
+            self.step_log({f'{task.__class__.__name__}/train/{k}': avg})
 
         save_step_freq = self.config.save_step_freq.value()
         assert save_step_freq is not None
