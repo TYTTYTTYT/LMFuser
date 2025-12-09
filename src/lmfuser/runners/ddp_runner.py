@@ -661,6 +661,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         self.step += 1
 
     def train(self, *args: Any, **kwargs: Any) -> None:
+        self.eval() # evaluate first
         self._prepare_train()
 
         self._last_epoch = self.epoch
