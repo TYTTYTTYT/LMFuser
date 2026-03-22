@@ -3,6 +3,7 @@ from collections.abc import Iterable, Iterator
 
 import torch
 from torch import nn
+from torch.optim import Optimizer
 from lmfuser_data.interfaces import Batch, Row
 from lmfuser_data.scanners import Scanner
 from lmfuser_data import DataLoader, PyTorchDataLoader
@@ -345,6 +346,34 @@ class TaskBase(Conf, SubclassTracer):
         return None
 
     def get_collate_fn(self) -> Callable[[list[Row]], Batch] | None:
+        return None
+
+    def get_extra_models(self) -> dict[str, nn.Module] | None:
+        """Return extra models (e.g. discriminator) that need DDP/FSDP wrapping.
+
+        The returned models will be wrapped by the runner and passed to
+        ``train_step`` via ``kwargs['extra_models']``.  Override this in
+        subclasses that require adversarial or multi-model training.
+
+        Returns:
+            A dict mapping names to ``nn.Module`` instances, or ``None``.
+        """
+        return None
+
+    def get_extra_optimizers(
+        self, extra_models: dict[str, nn.Module]
+    ) -> dict[str, torch.optim.Optimizer] | None:
+        """Return optimizers for extra models.
+
+        Called after ``get_extra_models`` with the (already DDP/FSDP-wrapped)
+        models.  Override this together with ``get_extra_models``.
+
+        Args:
+            extra_models: The wrapped extra models returned by the runner.
+
+        Returns:
+            A dict mapping the **same** names to optimizers, or ``None``.
+        """
         return None
 
 

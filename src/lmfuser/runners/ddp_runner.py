@@ -260,6 +260,27 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         self._all_eval_results: dict[str, list[dict[str, Any]]] = {}
         self._test_results: dict[str, dict[str, Any]] = {}
 
+        # Collect and wrap extra models from tasks
+        self._extra_models: dict[str, nn.Module] = {}
+        self._extra_model_task_map: dict[str, int] = {}  # name -> task_id
+        for task_id, task in enumerate(self.tasks):
+            extra = task.get_extra_models()
+            if extra is not None:
+                for name, model in extra.items():
+                    if name in self._extra_models:
+                        raise ValueError(f'Duplicate extra model name: {name}')
+                    if self.dp_type == 'ddp':
+                        wrapped = DDPWraper(model)
+                    elif self.dp_type == 'fsdp2':
+                        if not isinstance(model, FSDPModule):
+                            wrapped = DDPWraper(model)
+                        else:
+                            wrapped = FSDP2Wrapper(model)
+                    else:
+                        raise ValueError(f'Unknown dp_type: {self.dp_type}')
+                    self._extra_models[name] = wrapped
+                    self._extra_model_task_map[name] = task_id
+
     def sample_train_task_id(self) -> int:
         '''
         by default, randomly select a task from the task list.
@@ -348,6 +369,22 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                     'epoch': self.epoch,
                     'config': self.config.to_dict(),
                 }, indent=4))
+
+            # Save extra models and their optimizers
+            for name, extra_model in self._extra_models.items():
+                extra_dir = path / 'extra_models' / name
+                os.makedirs(extra_dir, exist_ok=True)
+                if isinstance(extra_model, (DDPWraper, Wrapper)):
+                    torch.save(extra_model.model.module.state_dict(), extra_dir / 'model.pt')
+                elif isinstance(extra_model, FSDP2Wrapper):
+                    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                    states = get_model_state_dict(extra_model.model, options=options)
+                    torch.save(states, extra_dir / 'model.pt')
+                if name in self._extra_optimizers:
+                    torch.save(
+                        self._extra_optimizers[name].state_dict(),
+                        extra_dir / 'optimizer.pt'
+                    )
 
     @property
     def model(self) -> DDPWraper | FSDP2Wrapper:
@@ -462,6 +499,29 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         else:
             self.scaler = scaler
 
+        # Initialize extra optimizers from tasks
+        self._extra_optimizers: dict[str, Optimizer] = {}
+        if self._extra_models:
+            for task_id, task in enumerate(self.tasks):
+                extra = task.get_extra_optimizers(self._extra_models)
+                if extra is not None:
+                    for name, opt in extra.items():
+                        if name not in self._extra_models:
+                            raise ValueError(
+                                f'Extra optimizer "{name}" has no matching extra model'
+                            )
+                        self._extra_optimizers[name] = opt
+
+            # Restore extra optimizer states if resuming
+            if hasattr(self, '_extra_optimizer_states'):
+                for name, states in self._extra_optimizer_states.items():
+                    if name in self._extra_optimizers:
+                        self._extra_optimizers[name].load_state_dict(states)
+                        for state in self._extra_optimizers[name].state.values():
+                            for k, v in state.items():
+                                if torch.is_tensor(v):
+                                    state[k] = v.to(get_default_device(), non_blocking=True)
+
     def _next_train_batch(self, task_idx: int) -> Batch:
         if self.train_data_loaders[task_idx] is None:
             raise ValueError(f'No train dataloader for task {task_idx}')
@@ -545,9 +605,12 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 subbatch_result = task.train_step(
                     model=self.model, # type: ignore
                     batch=self._batch_to_device(self._next_train_batch(task_id)),
-                    step=self.step, 
+                    step=self.step,
                     device=get_local_rank(),
                     acc_step=acc_idx,
+                    extra_models=self._extra_models if self._extra_models else None,
+                    extra_optimizers=self._extra_optimizers if self._extra_optimizers else None,
+                    num_acc_steps=self.config._num_acc_steps,
                 )
                 if isinstance(subbatch_result, torch.Tensor):
                     subbatch_result = {'loss': subbatch_result}
@@ -896,3 +959,24 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 self.pre_epoch = int(runner_state['epoch'])
         else:
             logger.warning(f'runner.json not found in {directory}, skip loading runner state')
+
+        # Load extra model and optimizer states
+        extra_models_dir = Path(directory) / 'extra_models'
+        if extra_models_dir.exists():
+            self._extra_optimizer_states: dict[str, dict] = {}
+            for name in os.listdir(extra_models_dir):
+                extra_dir = extra_models_dir / name
+                model_path = extra_dir / 'model.pt'
+                if model_path.exists() and name in self._extra_models:
+                    extra_model = self._extra_models[name]
+                    states = torch.load(model_path, map_location='cpu')
+                    if isinstance(extra_model, (DDPWraper, Wrapper)):
+                        extra_model.model.module.load_state_dict(states)
+                    elif isinstance(extra_model, FSDP2Wrapper):
+                        extra_model.model.load_state_dict(states)
+                    logger.info(f'Loaded extra model "{name}" from {model_path}')
+
+                optim_path = extra_dir / 'optimizer.pt'
+                if optim_path.exists():
+                    self._extra_optimizer_states[name] = torch.load(optim_path, map_location='cpu')
+                    logger.info(f'Loaded extra optimizer "{name}" from {optim_path}')
