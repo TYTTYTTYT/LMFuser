@@ -772,6 +772,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self.model_loader.model_path = test_model_path
             self._model = None
 
+        self.model.eval()  # ensure eval mode after potential model reload
         batch_list: list[dict[str, list[Any]]] = []
         with ExitStack() as stack:
             stack.enter_context(torch.no_grad())
