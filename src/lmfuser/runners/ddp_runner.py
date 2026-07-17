@@ -59,12 +59,20 @@ logger = logging.getLogger(__name__)
 T = TypeVar('T', bound=Conf)
 
 
+def _compile_kwargs(compile_mode: str) -> dict:
+    return {} if compile_mode == 'default' else {'mode': compile_mode}
+
+
 class Wrapper(nn.Module):
 
-    def __init__(self, model: nn.Module) -> None:
+    def __init__(self, model: nn.Module, compile_mode: str = 'disable') -> None:
         super().__init__()
         self.module = model.to(get_default_device())
-        self.forward = model.forward
+        if compile_mode != 'disable':
+            logger.critical(f'torch.compile enabled (mode={compile_mode})')
+            self.forward = torch.compile(model.forward, **_compile_kwargs(compile_mode))
+        else:
+            self.forward = model.forward
 
     def no_sync(self):
         # duck-type DDP for the accumulation path: a single process has no
@@ -83,12 +91,23 @@ class Wrapper(nn.Module):
 
 class DDPWraper(nn.Module):
 
-    def __init__(self, model: nn.Module) -> None:
+    def __init__(self, model: nn.Module, compile_mode: str = 'disable') -> None:
         super().__init__()
-        self.model = DDP(
-            model.to(get_default_device()), find_unused_parameters=True
-        ) if get_world_size() > 1 else Wrapper(model)
-        self.forward = self.model.forward
+        if get_world_size() > 1:
+            self.model = DDP(
+                model.to(get_default_device()), find_unused_parameters=True
+            )
+            if compile_mode != 'disable':
+                # compile the DDP module so Dynamo's DDPOptimizer splits the
+                # graph at gradient-bucket boundaries (keeps comm overlap).
+                # OptimizedModule forwards attribute access to the DDP module,
+                # so .module / .no_sync() paths keep working.
+                logger.critical(f'torch.compile enabled (mode={compile_mode})')
+                self.model = torch.compile(self.model, **_compile_kwargs(compile_mode))
+            self.forward = self.model.forward
+        else:
+            self.model = Wrapper(model, compile_mode=compile_mode)
+            self.forward = self.model.forward
 
     def __getattr__(self, name: str) -> Any:
         try:
@@ -98,11 +117,28 @@ class DDPWraper(nn.Module):
 
 
 class FSDP2Wrapper(nn.Module):
-    def __init__(self, model: FSDPModule) -> None:
+    def __init__(self, model: FSDPModule, compile_mode: str = 'disable') -> None:
         super().__init__()
         self.model = model
+        if compile_mode == 'reduce-overhead':
+            logger.critical(
+                'compile_mode=reduce-overhead is unsupported with fsdp2 '
+                '(cudagraphs need static addresses; FSDP all-gathers allocate '
+                'dynamically) — downgrading to "default".')
+            compile_mode = 'default'
+        if compile_mode != 'disable':
+            logger.critical(f'torch.compile enabled (mode={compile_mode})')
+            # compile the callable, NOT stored as a submodule: registering the
+            # OptimizedModule would duplicate every parameter under a second
+            # name and break optimizer construction / state_dict.
+            object.__setattr__(self, '_compiled_fwd',
+                               torch.compile(model, **_compile_kwargs(compile_mode)))
+        else:
+            object.__setattr__(self, '_compiled_fwd', None)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
+        if self._compiled_fwd is not None:
+            return self._compiled_fwd(*args, **kwargs)
         return self.model(*args, **kwargs) # type: ignore
 
     def __getattr__(self, name: str) -> Any:
@@ -137,6 +173,14 @@ class DDPRunnerConfig(RunerConf):
     lr_scheduler: LRSchedulerConfig = LRSchedulerConfig()
 
     dp_type = OptionArg(default='ddp', options=['ddp', 'fsdp2'])
+    # torch.compile for the training model. 'default' = Inductor fusion;
+    # 'reduce-overhead' additionally wraps CUDA graphs (ddp only — with fsdp2 it
+    # is downgraded to 'default': cudagraphs' static-address requirement is
+    # incompatible with FSDP's dynamically allocated all-gather buffers).
+    # Explicit-by-config on purpose: anything that changes numerics or the
+    # execution path must be declared in the YAML, never auto-detected.
+    # NOTE 'disable' not 'off': YAML 1.1 parses bare off/on/yes/no as booleans
+    compile_mode = OptionArg(default='disable', options=['disable', 'default', 'reduce-overhead'])
     model_precision = OptionArg(options=['fp32', 'fp16', 'bf16'], default='fp32')
     use_amp = BoolArg(default=False)
     amp_precision = OptionArg(options=['fp16', 'bf16'], default='fp16')
@@ -378,12 +422,14 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 model = model.bfloat16() # type: ignore
             elif self.config.model_precision.value() == 'fp32':
                 model = model.float() # type: ignore
+            compile_mode = self.config.compile_mode.value()
+            assert compile_mode is not None
             if isinstance(model, FSDPModule):
                 logger.critical(f'wrapping model with FSDPModule')
-                self._model = FSDP2Wrapper(model)
+                self._model = FSDP2Wrapper(model, compile_mode=compile_mode)
             else:
                 logger.critical(f'wrapping model with DDPWraper')
-                self._model = DDPWraper(model)
+                self._model = DDPWraper(model, compile_mode=compile_mode)
         assert self._model is not None
         return self._model
 
