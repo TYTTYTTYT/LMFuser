@@ -66,6 +66,12 @@ class Wrapper(nn.Module):
         self.module = model.to(get_default_device())
         self.forward = model.forward
 
+    def no_sync(self):
+        # duck-type DDP for the accumulation path: a single process has no
+        # gradient sync to skip (latent crash: single GPU + grad accumulation)
+        from contextlib import nullcontext
+        return nullcontext()
+
     def __getattr__(self, name: str) -> Any:
         try:
             return super().__getattr__(name)
