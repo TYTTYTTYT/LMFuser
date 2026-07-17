@@ -42,7 +42,11 @@ def dist_init() -> None:
     device_type = get_default_device_type()
 
     if device_type == 'cuda':
-        dist.init_process_group(backend='nccl')
+        import datetime as _dt
+        # 1h timeout: a transient data stall on one rank (e.g. a shard
+        # download hang) must not nuke the whole DDP group (default 10min
+        # killed a pretrain run mid-flight)
+        dist.init_process_group(backend='nccl', timeout=_dt.timedelta(seconds=3600))
         torch.cuda.set_device(get_local_rank())
     elif device_type == 'npu':
         dist.init_process_group(backend='hccl')

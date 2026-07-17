@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from lmfuser_data.interfaces import Batch, Row
 from lmfuser_data.scanners import Scanner
-from lmfuser_data import DataLoader, PyTorchDataLoader
+from lmfuser_data import DataLoader, PyTorchDataLoader, BatchDataLoader
 from lmfuser_data.interfaces import SubclassTracer
 from hyperargs import Conf, StrArg, FloatArg, IntArg, OptionArg, add_dependency, monitor_on
 
@@ -53,7 +53,7 @@ class TaskBase(Conf, SubclassTracer):
 
     scanner_type = OptionArg(default='C4Scanner', option_fn=scanner_type_list)
 
-    train_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded', 'empty'])
+    train_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded', 'batch', 'empty'])
     eval_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded', 'empty'])
     test_dataloader_type = OptionArg(default='single file', options=['single file', 'sharded', 'empty'])
 
@@ -106,8 +106,11 @@ class TaskBase(Conf, SubclassTracer):
         worker_timeout: float,
         num_workers: int,
         rank: int,
-        world_size: int
-    ) -> None | DataLoader | PyTorchDataLoader | EmptyDataLoader:
+        world_size: int,
+        num_batch_workers: int = 4,
+        batch_queue_depth: int = 4,
+        batch_slot_mb: int = 128,
+    ) -> None | DataLoader | PyTorchDataLoader | BatchDataLoader | EmptyDataLoader:
         if self.num_train_data_path.value() == 0:
             return None
         if self._train_dataloader is not None:
@@ -118,9 +121,30 @@ class TaskBase(Conf, SubclassTracer):
         assert scanner_type is not None, 'scanner_type is None'
 
         dataloader_type = self.train_dataloader_type.value()
-        assert dataloader_type in ('sharded', 'single file'), f'Unknown dataloader type: {dataloader_type}'
+        assert dataloader_type in ('sharded', 'single file', 'batch', 'empty'), \
+            f'Unknown dataloader type: {dataloader_type}'
 
-        if dataloader_type == 'sharded':
+        if dataloader_type == 'batch':
+            self._train_dataloader = BatchDataLoader(
+                batch_size=batch_size,
+                path_list=path_list, # type: ignore
+                distributor_weights=weight_list, # type: ignore
+                scanner_type=Scanner.get_subclass(scanner_type),
+                seed=seed,
+                shuffle=shuffle,
+                map_fn=self.get_row_processor(),
+                flow_fn=self.get_flow_processor(),
+                collate_fn=self.get_collate_fn(),
+                batch_map_fn=self.get_batch_processor(),
+                ignore_error=ignore_error,
+                num_workers=num_batch_workers,
+                queue_depth=batch_queue_depth,
+                slot_mb=batch_slot_mb,
+                num_ranks=world_size,
+                rank_idx=rank,
+                worker_timeout=worker_timeout,
+            )
+        elif dataloader_type == 'sharded':
             self._train_dataloader = DataLoader(
                 batch_size=batch_size,
                 path_list=path_list, # type: ignore
@@ -402,8 +426,11 @@ class Tasks(Conf):
         worker_timeout: float,
         num_workers: int,
         rank: int,
-        world_size: int
-    ) -> list[DataLoader | None | PyTorchDataLoader | EmptyDataLoader]:
+        world_size: int,
+        num_batch_workers: int = 4,
+        batch_queue_depth: int = 4,
+        batch_slot_mb: int = 128,
+    ) -> list[DataLoader | None | PyTorchDataLoader | BatchDataLoader | EmptyDataLoader]:
         return [
             task.conf._get_train_dataloader(
                 batch_size=batch_size,
@@ -417,6 +444,9 @@ class Tasks(Conf):
                 num_workers=num_workers,
                 rank=rank,
                 world_size=world_size,
+                num_batch_workers=num_batch_workers,
+                batch_queue_depth=batch_queue_depth,
+                batch_slot_mb=batch_slot_mb,
             )
             for task in self.tasks
         ]

@@ -66,11 +66,19 @@ class Wrapper(nn.Module):
         self.module = model.to(get_default_device())
         self.forward = model.forward
 
+    def no_sync(self):
+        # duck-type DDP for the accumulation path: a single process has no
+        # gradient sync to skip (latent crash: single GPU + grad accumulation)
+        from contextlib import nullcontext
+        return nullcontext()
+
     def __getattr__(self, name: str) -> Any:
         try:
             return super().__getattr__(name)
-        except:
-            return self.module.__getattr__(name)
+        except AttributeError:
+            # full lookup (instance dict included) — nn.Module.__getattr__ alone
+            # misses plain attributes like `.config`
+            return getattr(self.module, name)
 
 
 class DDPWraper(nn.Module):
@@ -85,8 +93,8 @@ class DDPWraper(nn.Module):
     def __getattr__(self, name: str) -> Any:
         try:
             return super().__getattr__(name)
-        except:
-            return self.model.module.__getattr__(name)
+        except AttributeError:
+            return getattr(self.model.module, name)
 
 
 class FSDP2Wrapper(nn.Module):
@@ -141,6 +149,11 @@ class DDPRunnerConfig(RunerConf):
     shuffle_dataset = BoolArg(default=True)
     row_prefetch = IntArg(0, min_value=0)
     num_row_workers = IntArg(1, min_value=1)
+    # batch-mode loader (train_dataloader_type: batch): TOTAL workers per rank,
+    # shared-memory ring depth, and per-slot capacity
+    num_batch_workers = IntArg(4, min_value=1)
+    batch_queue_depth = IntArg(4, min_value=2)
+    batch_slot_mb = IntArg(128, min_value=1)
 
     resume_training = BoolArg(default=False)
     resume_path = StrArg(default=None, allow_none=True)
@@ -202,6 +215,9 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             worker_timeout=config.worker_timeout.value(), # type: ignore
             world_size=get_world_size(),
             rank=get_global_rank(),
+            num_batch_workers=config.num_batch_workers.value(), # type: ignore
+            batch_queue_depth=config.batch_queue_depth.value(), # type: ignore
+            batch_slot_mb=config.batch_slot_mb.value(), # type: ignore
         )
 
         self.eval_data_loaders = config.task_conf.get_eval_dataloaders(
