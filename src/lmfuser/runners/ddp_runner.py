@@ -342,6 +342,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         self.config.seed = self.config.seed.parse(hash(f'original_seed_{self.config.seed.value()}|step_{self.step}'))
 
         self.train_data_loaders = config.task_conf.get_train_dataloaders(
+            resume_states=getattr(self, '_resume_data_states', None),
             batch_size=config.sub_batch_size.value(), # type: ignore
             seed=config.seed.value(), # type: ignore
             shuffle=config.shuffle_dataset.value(), # type: ignore
@@ -459,6 +460,35 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         else:
             raise ValueError(f'dp_type must be either "ddp" or "fsdp2", got "{self.dp_type}" instead.')
 
+    def _collect_data_states(self) -> list | None:
+        """Per-task shard-cursor tables, merged across ranks (rank0 only;
+        other ranks and loaders without cursor support return/contribute
+        None). A COLLECTIVE call when world_size > 1 — every rank must
+        reach it."""
+        per_task = [
+            loader.state_dict()
+            if loader is not None and hasattr(loader, 'state_dict') else None
+            for loader in self.train_data_loaders
+        ]
+        if not any(s is not None for s in per_task):
+            return None
+        if get_world_size() > 1:
+            gathered: list[Any] = [None] * get_world_size()
+            torch.distributed.all_gather_object(gathered, per_task)
+            if get_global_rank() != 0:
+                return None
+            merged: list = []
+            for task_idx in range(len(per_task)):
+                m: dict = {}
+                for rank_states in gathered:
+                    state = rank_states[task_idx] if rank_states else None
+                    if state:
+                        for src, table in state.items():
+                            m.setdefault(src, {}).update(table)
+                merged.append(m or None)
+            return merged
+        return per_task
+
     def save(self, directory: str | os.PathLike, *args, **kwargs) -> None:
         if isinstance(self.model, (DDPWraper, Wrapper)):
             model = self.model.model.module
@@ -484,10 +514,18 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         else:
             raise ValueError(f'Unknown model type {type(self.model)}')
         
+        data_states = self._collect_data_states()
+
         if get_global_rank() == 0:
             path = Path(directory) / str(self.step)
             os.makedirs(path, exist_ok=True)
             self.model_loader.save_model(model, path) # type: ignore
+
+            if data_states is not None:
+                tmp_path = path / 'data_state.json.tmp'
+                with open(tmp_path, 'w') as f:
+                    json.dump(data_states, f)
+                os.replace(tmp_path, path / 'data_state.json')
 
             optimizer_path = path / 'optimizer.pt'
             torch.save(optim_states, optimizer_path)
@@ -1128,6 +1166,19 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self._scheduler_states = torch.load(scheduler_path)
         else:
             logger.warning(f'scheduler.pt not found in {directory}, skip loading scheduler')
+
+        data_state_path = Path(directory) / 'data_state.json'
+        if data_state_path.exists():
+            with open(data_state_path, 'r') as f:
+                self._resume_data_states = json.load(f)
+            n = sum(
+                len(tab)
+                for task_state in self._resume_data_states if task_state
+                for tab in task_state.values()
+            )
+            logger.info(f'loaded data stream state ({n} shard cursors)')
+        else:
+            logger.info('no data_state.json in checkpoint — data stream restarts from scratch')
 
         runner_path = Path(directory) / 'runner.json'
         if runner_path.exists():
