@@ -10,7 +10,7 @@ from torch.optim import (
     Adadelta,
     Adagrad
 )
-from hyperargs import Conf, OptionArg, FloatArg, BoolArg, add_dependency, monitor_on
+from hyperargs import Conf, OptionArg, FloatArg, BoolArg, add_dependency, monitor_on, IntArg
 
 
 class OptimizerConfigBase(Conf):
