@@ -32,6 +32,8 @@ class AdamWConfig(OptimizerConfigBase):
     eps = FloatArg(1e-8, min_value=0.0, max_value=1.0)
     weight_decay = FloatArg(0.01, min_value=0.0, max_value=1.0)
     amsgrad = BoolArg(False)
+    # fused CUDA kernel (single multi-tensor launch); ignored on CPU
+    fused = IntArg(0, min_value=0, max_value=1)
 
     def init_optimzier(
         self, 
@@ -43,7 +45,8 @@ class AdamWConfig(OptimizerConfigBase):
             betas=(self.beta1.value(), self.beta2.value()), # type: ignore
             eps=self.eps.value(), # type: ignore
             weight_decay=self.weight_decay.value(), # type: ignore
-            amsgrad=self.amsgrad.value() # type: ignore
+            amsgrad=self.amsgrad.value(), # type: ignore
+            fused=bool(self.fused.value()) or None, # type: ignore
         )
 
 

@@ -91,12 +91,16 @@ class Wrapper(nn.Module):
 
 class DDPWraper(nn.Module):
 
-    def __init__(self, model: nn.Module, compile_mode: str = 'disable') -> None:
+    def __init__(self, model: nn.Module, compile_mode: str = 'disable', find_unused: bool = True, bf16_grads: bool = False) -> None:
         super().__init__()
         if get_world_size() > 1:
             self.model = DDP(
-                model.to(get_default_device()), find_unused_parameters=True
+                model.to(get_default_device()),
+                find_unused_parameters=find_unused,
             )
+            if bf16_grads:
+                from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
+                self.model.register_comm_hook(None, default_hooks.bf16_compress_hook)
             if compile_mode != 'disable':
                 # compile the DDP module so Dynamo's DDPOptimizer splits the
                 # graph at gradient-bucket boundaries (keeps comm overlap).
@@ -186,6 +190,14 @@ class DDPRunnerConfig(RunerConf):
     # ~6 wandb/logger calls + .item() syncs + a barrier — about half the step
     # time for a 116M model. Logged values are point samples at the logged step.
     metric_sync_freq = IntArg(1, min_value=1)
+    # DDP tuning. find_unused_parameters=1 (default, safest) supports tasks
+    # where a subset of parameters gets no grad on some steps (GAN/GRPO mode
+    # switching) at the cost of a per-step graph traversal and weaker comm
+    # overlap. Plain single-player training should set 0.
+    ddp_find_unused = IntArg(1, min_value=0, max_value=1)
+    # compress gradient allreduce to bf16 (halves comm volume; fp32 master
+    # weights are untouched — only the wire format changes)
+    ddp_bf16_grads = IntArg(0, min_value=0, max_value=1)
     model_precision = OptionArg(options=['fp32', 'fp16', 'bf16'], default='fp32')
     use_amp = BoolArg(default=False)
     amp_precision = OptionArg(options=['fp16', 'bf16'], default='fp16')
@@ -434,7 +446,11 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 self._model = FSDP2Wrapper(model, compile_mode=compile_mode)
             else:
                 logger.critical(f'wrapping model with DDPWraper')
-                self._model = DDPWraper(model, compile_mode=compile_mode)
+                self._model = DDPWraper(
+                    model, compile_mode=compile_mode,
+                    find_unused=bool(self.config.ddp_find_unused.value()),
+                    bf16_grads=bool(self.config.ddp_bf16_grads.value()),
+                )
         assert self._model is not None
         return self._model
 
