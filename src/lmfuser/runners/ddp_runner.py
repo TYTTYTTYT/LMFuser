@@ -261,20 +261,20 @@ class DDPRunnerConfig(RunerConf):
     # where a subset of parameters gets no grad on some steps (GAN/GRPO mode
     # switching) at the cost of a per-step graph traversal and weaker comm
     # overlap. Plain single-player training should set 0.
-    ddp_find_unused = IntArg(1, min_value=0, max_value=1)
+    ddp_find_unused = BoolArg(default=True)
     # compress gradient allreduce to bf16 (halves comm volume; fp32 master
     # weights are untouched — only the wire format changes)
-    ddp_bf16_grads = IntArg(0, min_value=0, max_value=1)
+    ddp_bf16_grads = BoolArg(default=False)
     # double-buffered device prefetch: a background thread fetches batch N+1
     # and copies it to the GPU on a side stream (pinned staging) while the GPU
     # computes step N. Removes the serialized fetch+H2D segments from the step
     # wall (measured ~40-120ms/step). Tensor-only batches.
-    device_prefetch = IntArg(0, min_value=0, max_value=1)
+    device_prefetch = BoolArg(default=False)
     # diagnostic: log per-step wall time split into fetch / h2d / traincall
     # segments every metric_sync_freq steps. fetch = waiting on the loader,
     # h2d = host-to-device copy (0 with device_prefetch), traincall = the
     # task.train_step call including any GPU-queue wait it absorbs.
-    step_timing = IntArg(0, min_value=0, max_value=1)
+    step_timing = BoolArg(default=False)
     model_precision = OptionArg(options=['fp32', 'fp16', 'bf16'], default='fp32')
     use_amp = BoolArg(default=False)
     amp_precision = OptionArg(options=['fp16', 'bf16'], default='fp16')
@@ -563,8 +563,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 logger.critical(f'wrapping model with DDPWraper')
                 self._model = DDPWraper(
                     model, compile_mode=compile_mode,
-                    find_unused=bool(self.config.ddp_find_unused.value()),
-                    bf16_grads=bool(self.config.ddp_bf16_grads.value()),
+                    find_unused=self.config.ddp_find_unused.value(),
+                    bf16_grads=self.config.ddp_bf16_grads.value(),
                 )
         assert self._model is not None
         return self._model
