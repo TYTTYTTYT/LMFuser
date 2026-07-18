@@ -63,6 +63,72 @@ def _compile_kwargs(compile_mode: str) -> dict:
     return {} if compile_mode == 'default' else {'mode': compile_mode}
 
 
+class _TqdmLogHandler(logging.Handler):
+    """Route logging through tqdm.write so log lines print above the progress
+    bar instead of tearing through it mid-refresh."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+class _DevicePrefetcher:
+    """Background fetch + side-stream H2D double buffering over a dataloader.
+
+    next() returns a device-resident batch whose copy has completed (event
+    sync on the compute stream, not the host)."""
+
+    def __init__(self, loader, device, precision: str) -> None:
+        import threading, queue as _q
+        self._loader = loader
+        self._device = device
+        self._precision = precision
+        self._stream = torch.cuda.Stream(device=device)
+        self._queue: _q.Queue = _q.Queue(maxsize=2)
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _cast(self, v: Tensor) -> Tensor:
+        if torch.is_floating_point(v):
+            dt = {'fp32': torch.float32, 'fp16': torch.float16, 'bf16': torch.bfloat16}[self._precision]
+            if v.dtype != dt:
+                v = v.to(dt)
+        return v
+
+    def _run(self) -> None:
+        it = iter(self._loader)
+        while not self._stop:
+            try:
+                batch = next(it)
+            except StopIteration:
+                it = iter(self._loader)
+                batch = next(it)
+            with torch.cuda.stream(self._stream):
+                dev = {}
+                ok = True
+                for k, v in batch.items():
+                    if isinstance(v, Tensor):
+                        v = self._cast(v)
+                        dev[k] = v.pin_memory().to(self._device, non_blocking=True)
+                    else:
+                        dev[k] = v
+                ev = torch.cuda.Event()
+                ev.record(self._stream)
+            self._queue.put((dev, ev))
+
+    def next(self):
+        dev, ev = self._queue.get()
+        # make the COMPUTE stream wait for the copy — no host sync
+        torch.cuda.current_stream().wait_event(ev)
+        return dev
+
+    def close(self) -> None:
+        self._stop = True
+
+
 class Wrapper(nn.Module):
 
     def __init__(self, model: nn.Module, compile_mode: str = 'disable') -> None:
@@ -91,12 +157,17 @@ class Wrapper(nn.Module):
 
 class DDPWraper(nn.Module):
 
-    def __init__(self, model: nn.Module, compile_mode: str = 'disable') -> None:
+    def __init__(self, model: nn.Module, compile_mode: str = 'disable', find_unused: bool = True, bf16_grads: bool = False) -> None:
         super().__init__()
         if get_world_size() > 1:
+            logger.critical(f'DDP options: find_unused={find_unused} bf16_grads={bf16_grads}')
             self.model = DDP(
-                model.to(get_default_device()), find_unused_parameters=True
+                model.to(get_default_device()),
+                find_unused_parameters=find_unused,
             )
+            if bf16_grads:
+                from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
+                self.model.register_comm_hook(None, default_hooks.bf16_compress_hook)
             if compile_mode != 'disable':
                 # compile the DDP module so Dynamo's DDPOptimizer splits the
                 # graph at gradient-bucket boundaries (keeps comm overlap).
@@ -181,6 +252,29 @@ class DDPRunnerConfig(RunerConf):
     # execution path must be declared in the YAML, never auto-detected.
     # NOTE 'disable' not 'off': YAML 1.1 parses bare off/on/yes/no as booleans
     compile_mode = OptionArg(default='disable', options=['disable', 'default', 'reduce-overhead'])
+    # gather/log training metrics every N steps. At freq=1 the per-step cost is
+    # substantial for fast steps: a metrics all_gather + a dist_avg collective +
+    # ~6 wandb/logger calls + .item() syncs + a barrier — about half the step
+    # time for a 116M model. Logged values are point samples at the logged step.
+    metric_sync_freq = IntArg(1, min_value=1)
+    # DDP tuning. find_unused_parameters=1 (default, safest) supports tasks
+    # where a subset of parameters gets no grad on some steps (GAN/GRPO mode
+    # switching) at the cost of a per-step graph traversal and weaker comm
+    # overlap. Plain single-player training should set 0.
+    ddp_find_unused = BoolArg(default=True)
+    # compress gradient allreduce to bf16 (halves comm volume; fp32 master
+    # weights are untouched — only the wire format changes)
+    ddp_bf16_grads = BoolArg(default=False)
+    # double-buffered device prefetch: a background thread fetches batch N+1
+    # and copies it to the GPU on a side stream (pinned staging) while the GPU
+    # computes step N. Removes the serialized fetch+H2D segments from the step
+    # wall (measured ~40-120ms/step). Tensor-only batches.
+    device_prefetch = BoolArg(default=False)
+    # diagnostic: log per-step wall time split into fetch / h2d / traincall
+    # segments every metric_sync_freq steps. fetch = waiting on the loader,
+    # h2d = host-to-device copy (0 with device_prefetch), traincall = the
+    # task.train_step call including any GPU-queue wait it absorbs.
+    step_timing = BoolArg(default=False)
     model_precision = OptionArg(options=['fp32', 'fp16', 'bf16'], default='fp32')
     use_amp = BoolArg(default=False)
     amp_precision = OptionArg(options=['fp16', 'bf16'], default='fp16')
@@ -248,6 +342,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         self.config.seed = self.config.seed.parse(hash(f'original_seed_{self.config.seed.value()}|step_{self.step}'))
 
         self.train_data_loaders = config.task_conf.get_train_dataloaders(
+            resume_states=getattr(self, '_resume_data_states', None),
             batch_size=config.sub_batch_size.value(), # type: ignore
             seed=config.seed.value(), # type: ignore
             shuffle=config.shuffle_dataset.value(), # type: ignore
@@ -365,6 +460,35 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         else:
             raise ValueError(f'dp_type must be either "ddp" or "fsdp2", got "{self.dp_type}" instead.')
 
+    def _collect_data_states(self) -> list | None:
+        """Per-task shard-cursor tables, merged across ranks (rank0 only;
+        other ranks and loaders without cursor support return/contribute
+        None). A COLLECTIVE call when world_size > 1 — every rank must
+        reach it."""
+        per_task = [
+            loader.state_dict()
+            if loader is not None and hasattr(loader, 'state_dict') else None
+            for loader in self.train_data_loaders
+        ]
+        if not any(s is not None for s in per_task):
+            return None
+        if get_world_size() > 1:
+            gathered: list[Any] = [None] * get_world_size()
+            torch.distributed.all_gather_object(gathered, per_task)
+            if get_global_rank() != 0:
+                return None
+            merged: list = []
+            for task_idx in range(len(per_task)):
+                m: dict = {}
+                for rank_states in gathered:
+                    state = rank_states[task_idx] if rank_states else None
+                    if state:
+                        for src, table in state.items():
+                            m.setdefault(src, {}).update(table)
+                merged.append(m or None)
+            return merged
+        return per_task
+
     def save(self, directory: str | os.PathLike, *args, **kwargs) -> None:
         if isinstance(self.model, (DDPWraper, Wrapper)):
             model = self.model.model.module
@@ -390,10 +514,18 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         else:
             raise ValueError(f'Unknown model type {type(self.model)}')
         
+        data_states = self._collect_data_states()
+
         if get_global_rank() == 0:
             path = Path(directory) / str(self.step)
             os.makedirs(path, exist_ok=True)
             self.model_loader.save_model(model, path) # type: ignore
+
+            if data_states is not None:
+                tmp_path = path / 'data_state.json.tmp'
+                with open(tmp_path, 'w') as f:
+                    json.dump(data_states, f)
+                os.replace(tmp_path, path / 'data_state.json')
 
             optimizer_path = path / 'optimizer.pt'
             torch.save(optim_states, optimizer_path)
@@ -429,7 +561,11 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 self._model = FSDP2Wrapper(model, compile_mode=compile_mode)
             else:
                 logger.critical(f'wrapping model with DDPWraper')
-                self._model = DDPWraper(model, compile_mode=compile_mode)
+                self._model = DDPWraper(
+                    model, compile_mode=compile_mode,
+                    find_unused=self.config.ddp_find_unused.value(),
+                    bf16_grads=self.config.ddp_bf16_grads.value(),
+                )
         assert self._model is not None
         return self._model
 
@@ -559,11 +695,12 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         epochs = [loader.epoch for loader in self.train_data_loaders if loader is not None]
         return max(epochs) + self.pre_epoch
 
-    def step_log(self, data: dict[str, Any]) -> None:
+    def step_log(self, data: dict[str, Any], console: bool = True) -> None:
         self._wandb
         if get_global_rank() != 0:
             return
-        self.logger.critical(f'step:{self.step}\t{data}')
+        if console:
+            self.logger.critical(f'step:{self.step}\t{data}')
         wandb.log(data, step=self.step)
 
     def _one_train_step(self, **kwargs: Any) -> None:
@@ -577,6 +714,9 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         # calculate loss
         running_loss: float = 0.0
+        running_loss_t = None
+        _msf = self.config.metric_sync_freq.value() or 1
+        log_this = (self.step % _msf == 0)
         batch_datas: defaultdict[Hashable, List[float]] = defaultdict(list)
         subbatch_result_lst: list[Batch] = []
         for acc_idx in range(self.config._num_acc_steps):
@@ -604,13 +744,41 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                         self.model.set_requires_gradient_sync(True, recurse=True)
 
                 # compute loss for each sub_batch
+                import time as _time
+                _tf0 = _time.perf_counter()
+                if self.config.device_prefetch.value():
+                    if not hasattr(self, '_prefetchers'):
+                        self._prefetchers = {}
+                    pf = self._prefetchers.get(task_id)
+                    if pf is None:
+                        pf = _DevicePrefetcher(
+                            self.train_data_loaders[task_id],
+                            get_default_device(),
+                            self.config.model_precision.value(),
+                        )
+                        self._prefetchers[task_id] = pf
+                    _dev_batch = pf.next()
+                    _tf1 = _tf2 = _time.perf_counter()
+                else:
+                    _raw_batch = self._next_train_batch(task_id)
+                    _tf1 = _time.perf_counter()
+                    _dev_batch = self._batch_to_device(_raw_batch)
+                    _tf2 = _time.perf_counter()
+                if self.config.step_timing.value():
+                    if not hasattr(self, '_phase_acc'):
+                        self._phase_acc = [0.0, 0.0, 0.0, 0]
+                    self._phase_acc[0] += _tf1 - _tf0
+                    self._phase_acc[1] += _tf2 - _tf1
+                _tf2b = _time.perf_counter()
                 subbatch_result = task.train_step(
                     model=self.model, # type: ignore
-                    batch=self._batch_to_device(self._next_train_batch(task_id)),
-                    step=self.step, 
+                    batch=_dev_batch,
+                    step=self.step,
                     device=get_local_rank(),
                     acc_step=acc_idx,
                 )
+                if self.config.step_timing.value():
+                    self._phase_acc[2] += _time.perf_counter() - _tf2b
                 if isinstance(subbatch_result, torch.Tensor):
                     subbatch_result = {'loss': subbatch_result}
                 if 'loss' not in subbatch_result:
@@ -621,7 +789,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 subbatch_result_lst.append(subbatch_result) # type: ignore
                 assert isinstance(loss, Tensor)
                 loss = loss / self.config._num_acc_steps
-                running_loss += loss.item()
+                running_loss_t = loss.detach() if running_loss_t is None else running_loss_t + loss.detach()
                 for k, v in subbatch_result.items():
                     if k == 'loss':
                         continue
@@ -635,30 +803,66 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 else:
                     loss.backward()
 
-        running_loss = dist_avg(running_loss)
-        self.step_log({f'{task.__class__.__name__}/train/loss': running_loss})
-        self.step_log({'train/epoch': self.epoch})
-        for k, v in batch_datas.items():
-            try:
-                avg = sum(v) / len(v)
-            except:
-                continue
-            self.step_log({f'{task.__class__.__name__}/train/{k}': avg})
-        self._pbar_train.set_description(
-            f'train loss: {running_loss:.3g}', refresh=True
-        )
+        if log_this and getattr(self, '_phase_acc', None):
+            n = max(self._phase_acc[3], 1)
+            fetch_ms = self._phase_acc[0] / n * 1000
+            h2d_ms = self._phase_acc[1] / n * 1000
+            traincall_ms = self._phase_acc[2] / n * 1000
+            logger.critical(
+                f'[timing] fetch={fetch_ms:.1f}ms h2d={h2d_ms:.1f}ms '
+                f'traincall={traincall_ms:.1f}ms per-step (over {n} steps)')
+            # wandb: rank0's own segments plus the all-rank max of each — the
+            # max is the diagnostic one (in DDP the slowest rank paces the
+            # whole step, e.g. a data-starved rank shows up as fetch_ms_max)
+            t = torch.tensor([fetch_ms, h2d_ms, traincall_ms], device=get_default_device())
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+            mx = t.tolist()
+            self.step_log({
+                'timing/fetch_ms': fetch_ms,
+                'timing/h2d_ms': h2d_ms,
+                'timing/traincall_ms': traincall_ms,
+                'timing/fetch_ms_max': mx[0],
+                'timing/h2d_ms_max': mx[1],
+                'timing/traincall_ms_max': mx[2],
+            })
+            self._phase_acc = [0.0, 0.0, 0.0, 0]
+        if getattr(self, '_phase_acc', None) is not None:
+            self._phase_acc[3] += 1
+        if log_this:
+            running_loss = running_loss_t.item() if running_loss_t is not None else 0.0
+            running_loss = dist_avg(running_loss)
+            self.step_log({f'{task.__class__.__name__}/train/loss': running_loss})
+            self.step_log({'train/epoch': self.epoch})
+        if log_this:
+            for k, v in batch_datas.items():
+                try:
+                    avg = sum(v) / len(v)
+                except:
+                    continue
+                self.step_log({f'{task.__class__.__name__}/train/{k}': avg})
+            # the sampled step is part of the label: loss refreshes every
+            # metric_sync_freq steps while the bar ticks every step, and an
+            # unlabeled value reads as a frozen metric
+            self._pbar_train.set_postfix_str(
+                f'loss={running_loss:.3g}@{self.step}', refresh=True
+            )
 
         grad_norm_clip_val = self.config.grad_norm_clip.value()
         if grad_norm_clip_val is not None:
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
-            norm = clip_grad_norm_(
+            norm_t = clip_grad_norm_(
                 parameters=self.model.parameters(),  # type: ignore
                 max_norm=grad_norm_clip_val
-            ).item()
-            norm = dist_avg(norm)
-            self.step_log({f'{task.__class__.__name__}/train/grad_norm': norm})
+            )
+            if log_this:
+                norm = dist_avg(norm_t.item())
+                self.step_log({f'{task.__class__.__name__}/train/grad_norm': norm})
 
+        # pure host-side work — no .item() sync, no collective — so it runs and
+        # reports every step (wandb enqueue is async; console line only on
+        # log steps to keep the terminal readable)
         num_hot_params = 0
         num_freeze_params = 0
         for param in self.model.parameters(): # type: ignore
@@ -670,13 +874,12 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         num_total_params = num_hot_params + num_freeze_params
         if num_total_params == 0:
             raise RuntimeError('The model contains no parameters.')
-
         self.step_log({
             f'{task.__class__.__name__}/train/num_hot_params': num_hot_params,
             f'{task.__class__.__name__}/train/num_freeze_params': num_freeze_params,
             f'{task.__class__.__name__}/train/num_total_params': num_total_params,
             f'{task.__class__.__name__}/train/hot_ratio': num_hot_params / num_total_params,
-        })
+        }, console=log_this)
 
         if self.scaler is not None:
             self.scaler.step(self.optimizer)
@@ -688,21 +891,22 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             current_lr = current_lr[0]
         self.step_log(
             {f'{task.__class__.__name__}/train/learning_rate': current_lr}
-        )
+        ) if log_this else None
         self.scheduler.step()
 
-        other_step_results = defaultdict(list)
-        for r in subbatch_result_lst:
-            for k, v in r.items():
-                if isinstance(v, (float, int)):
-                    other_step_results[k].append(float(v))
-        all_other_step_results = batch_all_gather(other_step_results)
-        for k, v in all_other_step_results.items():
-            try:
-                avg = sum(v) / len(v)
-            except:
-                continue
-            self.step_log({f'{task.__class__.__name__}/train/{k}': avg})
+        if log_this:
+            other_step_results = defaultdict(list)
+            for r in subbatch_result_lst:
+                for k, v in r.items():
+                    if isinstance(v, (float, int)):
+                        other_step_results[k].append(float(v))
+            all_other_step_results = batch_all_gather(other_step_results)
+            for k, v in all_other_step_results.items():
+                try:
+                    avg = sum(v) / len(v)
+                except:
+                    continue
+                self.step_log({f'{task.__class__.__name__}/train/{k}': avg})
 
         save_step_freq = self.config.save_step_freq.value()
         assert save_step_freq is not None
@@ -712,7 +916,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             assert ckpt_path is not None
             self.save(ckpt_path)
             self._pbar_train.set_description('model saved!', True)
-        torch.distributed.barrier() if get_world_size() > 1 else ...
+            torch.distributed.barrier() if get_world_size() > 1 else ...
 
         eval_step_freq = self.config.eval_step_freq.value()
         assert eval_step_freq is not None
@@ -725,6 +929,16 @@ class DDPRunner(Runner[DDPRunnerConfig]):
     def train(self, *args: Any, **kwargs: Any) -> None:
         self.eval() # evaluate first
         self._prepare_train()
+
+        # route log lines through tqdm.write for the training run so they
+        # print cleanly above the bar (plain StreamHandlers tear through it)
+        root_logger = logging.getLogger()
+        if not any(isinstance(h, _TqdmLogHandler) for h in root_logger.handlers):
+            tqdm_handler = _TqdmLogHandler()
+            tqdm_handler.setFormatter(logging.Formatter(logging.BASIC_FORMAT))
+            for h in [x for x in root_logger.handlers if type(x) is logging.StreamHandler]:
+                root_logger.removeHandler(h)
+            root_logger.addHandler(tqdm_handler)
 
         self._last_epoch = self.epoch
         stop_metric = self.config.stop_by.value()
@@ -753,6 +967,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         while not self._should_stop():
             self._one_train_step()
             if stop_metric == 'step':
+                # per-step update is fine: tqdm only renders every mininterval
+                # (0.1s); the call itself is just a counter bump
                 self._pbar_train.update(1)
             elif stop_metric == 'epoch':
                 current_epoch = self.epoch
@@ -950,6 +1166,19 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self._scheduler_states = torch.load(scheduler_path)
         else:
             logger.warning(f'scheduler.pt not found in {directory}, skip loading scheduler')
+
+        data_state_path = Path(directory) / 'data_state.json'
+        if data_state_path.exists():
+            with open(data_state_path, 'r') as f:
+                self._resume_data_states = json.load(f)
+            n = sum(
+                len(tab)
+                for task_state in self._resume_data_states if task_state
+                for tab in task_state.values()
+            )
+            logger.info(f'loaded data stream state ({n} shard cursors)')
+        else:
+            logger.info('no data_state.json in checkpoint — data stream restarts from scratch')
 
         runner_path = Path(directory) / 'runner.json'
         if runner_path.exists():

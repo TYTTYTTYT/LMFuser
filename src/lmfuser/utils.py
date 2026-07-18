@@ -207,16 +207,11 @@ def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
     Returns:
         Dict[Dict[str, Union[Tensor, List[Any]]]]: 汇总后的batch
     """
-    logger.info(f'Begin all gather on rank {get_global_rank()}')
     if not dist.is_initialized():
         return batch
 
     gathered = {}
     for k, v_list in batch.items():
-        logger.info(f'Begin gather key {k} on rank {get_global_rank()}')
-        if isinstance(v_list, list):
-            logger.info(f'Key {k} with length {len(v_list)} on rank {get_global_rank()}')
-        logger.info(f'after barrier on rank {get_global_rank()}')
         if isinstance(v_list, Tensor):
             gathered[k] = tensor_all_gather(v_list)
         else:

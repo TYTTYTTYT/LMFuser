@@ -110,6 +110,7 @@ class TaskBase(Conf, SubclassTracer):
         num_batch_workers: int = 4,
         batch_queue_depth: int = 4,
         batch_slot_mb: int = 128,
+        resume_state: dict | None = None,
     ) -> None | DataLoader | PyTorchDataLoader | BatchDataLoader | EmptyDataLoader:
         if self.num_train_data_path.value() == 0:
             return None
@@ -143,6 +144,9 @@ class TaskBase(Conf, SubclassTracer):
                 num_ranks=world_size,
                 rank_idx=rank,
                 worker_timeout=worker_timeout,
+                # only forward when present: lmfuser-data < 0.3.0 has no
+                # resume_state parameter
+                **({'resume_state': resume_state} if resume_state else {}),
             )
         elif dataloader_type == 'sharded':
             self._train_dataloader = DataLoader(
@@ -430,6 +434,7 @@ class Tasks(Conf):
         num_batch_workers: int = 4,
         batch_queue_depth: int = 4,
         batch_slot_mb: int = 128,
+        resume_states: list[dict | None] | None = None,
     ) -> list[DataLoader | None | PyTorchDataLoader | BatchDataLoader | EmptyDataLoader]:
         return [
             task.conf._get_train_dataloader(
@@ -447,8 +452,9 @@ class Tasks(Conf):
                 num_batch_workers=num_batch_workers,
                 batch_queue_depth=batch_queue_depth,
                 batch_slot_mb=batch_slot_mb,
+                resume_state=(resume_states[i] if resume_states else None),
             )
-            for task in self.tasks
+            for i, task in enumerate(self.tasks)
         ]
 
     def get_eval_dataloaders(
