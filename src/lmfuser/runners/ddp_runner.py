@@ -755,10 +755,27 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         if log_this and getattr(self, '_phase_acc', None):
             n = max(self._phase_acc[3], 1)
+            fetch_ms = self._phase_acc[0] / n * 1000
+            h2d_ms = self._phase_acc[1] / n * 1000
+            traincall_ms = self._phase_acc[2] / n * 1000
             logger.critical(
-                f'[timing] fetch={self._phase_acc[0]/n*1000:.1f}ms '
-                f'h2d={self._phase_acc[1]/n*1000:.1f}ms '
-                f'traincall={self._phase_acc[2]/n*1000:.1f}ms per-step (over {n} steps)')
+                f'[timing] fetch={fetch_ms:.1f}ms h2d={h2d_ms:.1f}ms '
+                f'traincall={traincall_ms:.1f}ms per-step (over {n} steps)')
+            # wandb: rank0's own segments plus the all-rank max of each — the
+            # max is the diagnostic one (in DDP the slowest rank paces the
+            # whole step, e.g. a data-starved rank shows up as fetch_ms_max)
+            t = torch.tensor([fetch_ms, h2d_ms, traincall_ms], device=get_default_device())
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+            mx = t.tolist()
+            self.step_log({
+                'timing/fetch_ms': fetch_ms,
+                'timing/h2d_ms': h2d_ms,
+                'timing/traincall_ms': traincall_ms,
+                'timing/fetch_ms_max': mx[0],
+                'timing/h2d_ms_max': mx[1],
+                'timing/traincall_ms_max': mx[2],
+            })
             self._phase_acc = [0.0, 0.0, 0.0, 0]
         if getattr(self, '_phase_acc', None) is not None:
             self._phase_acc[3] += 1
