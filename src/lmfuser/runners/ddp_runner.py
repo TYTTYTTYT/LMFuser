@@ -646,11 +646,12 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         epochs = [loader.epoch for loader in self.train_data_loaders if loader is not None]
         return max(epochs) + self.pre_epoch
 
-    def step_log(self, data: dict[str, Any]) -> None:
+    def step_log(self, data: dict[str, Any], console: bool = True) -> None:
         self._wandb
         if get_global_rank() != 0:
             return
-        self.logger.critical(f'step:{self.step}\t{data}')
+        if console:
+            self.logger.critical(f'step:{self.step}\t{data}')
         wandb.log(data, step=self.step)
 
     def _one_train_step(self, **kwargs: Any) -> None:
@@ -807,31 +808,26 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 norm = dist_avg(norm_t.item())
                 self.step_log({f'{task.__class__.__name__}/train/grad_norm': norm})
 
-        # clearing stale grads on frozen params must run every step (tasks that
-        # flip requires_grad between steps rely on it), but the numel counting
-        # only feeds logs — do it on log steps only
-        if log_this:
-            num_hot_params = 0
-            num_freeze_params = 0
-            for param in self.model.parameters(): # type: ignore
-                if param.requires_grad == False:
-                    param.grad = None
-                    num_freeze_params += param.numel()
-                else:
-                    num_hot_params += param.numel()
-            num_total_params = num_hot_params + num_freeze_params
-            if num_total_params == 0:
-                raise RuntimeError('The model contains no parameters.')
-            self.step_log({
-                f'{task.__class__.__name__}/train/num_hot_params': num_hot_params,
-                f'{task.__class__.__name__}/train/num_freeze_params': num_freeze_params,
-                f'{task.__class__.__name__}/train/num_total_params': num_total_params,
-                f'{task.__class__.__name__}/train/hot_ratio': num_hot_params / num_total_params,
-            })
-        else:
-            for param in self.model.parameters(): # type: ignore
-                if param.requires_grad == False:
-                    param.grad = None
+        # pure host-side work — no .item() sync, no collective — so it runs and
+        # reports every step (wandb enqueue is async; console line only on
+        # log steps to keep the terminal readable)
+        num_hot_params = 0
+        num_freeze_params = 0
+        for param in self.model.parameters(): # type: ignore
+            if param.requires_grad == False:
+                param.grad = None
+                num_freeze_params += param.numel()
+            else:
+                num_hot_params += param.numel()
+        num_total_params = num_hot_params + num_freeze_params
+        if num_total_params == 0:
+            raise RuntimeError('The model contains no parameters.')
+        self.step_log({
+            f'{task.__class__.__name__}/train/num_hot_params': num_hot_params,
+            f'{task.__class__.__name__}/train/num_freeze_params': num_freeze_params,
+            f'{task.__class__.__name__}/train/num_total_params': num_total_params,
+            f'{task.__class__.__name__}/train/hot_ratio': num_hot_params / num_total_params,
+        }, console=log_this)
 
         if self.scaler is not None:
             self.scaler.step(self.optimizer)
@@ -906,20 +902,12 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         else:
             raise ValueError(f'Unknown stop metric: {stop_metric}. Please choose from "step" and "epoch".')
 
-        # batch bar updates to the metric sync cadence so every visible number
-        # (step count, rate, loss) advances together on log steps instead of
-        # the count ticking under a frozen loss
-        _pbar_pending = 0
-        _msf = self.config.metric_sync_freq.value() or 1
         while not self._should_stop():
             self._one_train_step()
             if stop_metric == 'step':
-                _pbar_pending += 1
-                # step was incremented inside _one_train_step; -1 realigns with
-                # the log_this cadence so the bar and the loss refresh together
-                if (self.step - 1) % _msf == 0:
-                    self._pbar_train.update(_pbar_pending)
-                    _pbar_pending = 0
+                # per-step update is fine: tqdm only renders every mininterval
+                # (0.1s); the call itself is just a counter bump
+                self._pbar_train.update(1)
             elif stop_metric == 'epoch':
                 current_epoch = self.epoch
                 if current_epoch > self._last_epoch:
@@ -928,8 +916,6 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             else:
                 raise ValueError(f'Unknown stop metric: {stop_metric}. Please choose from "step" and "epoch".')
 
-        if _pbar_pending:
-            self._pbar_train.update(_pbar_pending)
         self.test()
         self._pbar_train.close()
 
