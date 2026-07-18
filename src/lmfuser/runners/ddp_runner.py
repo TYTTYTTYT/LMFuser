@@ -63,6 +63,61 @@ def _compile_kwargs(compile_mode: str) -> dict:
     return {} if compile_mode == 'default' else {'mode': compile_mode}
 
 
+class _DevicePrefetcher:
+    """Background fetch + side-stream H2D double buffering over a dataloader.
+
+    next() returns a device-resident batch whose copy has completed (event
+    sync on the compute stream, not the host)."""
+
+    def __init__(self, loader, device, precision: str) -> None:
+        import threading, queue as _q
+        self._loader = loader
+        self._device = device
+        self._precision = precision
+        self._stream = torch.cuda.Stream(device=device)
+        self._queue: _q.Queue = _q.Queue(maxsize=2)
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _cast(self, v: Tensor) -> Tensor:
+        if torch.is_floating_point(v):
+            dt = {'fp32': torch.float32, 'fp16': torch.float16, 'bf16': torch.bfloat16}[self._precision]
+            if v.dtype != dt:
+                v = v.to(dt)
+        return v
+
+    def _run(self) -> None:
+        it = iter(self._loader)
+        while not self._stop:
+            try:
+                batch = next(it)
+            except StopIteration:
+                it = iter(self._loader)
+                batch = next(it)
+            with torch.cuda.stream(self._stream):
+                dev = {}
+                ok = True
+                for k, v in batch.items():
+                    if isinstance(v, Tensor):
+                        v = self._cast(v)
+                        dev[k] = v.pin_memory().to(self._device, non_blocking=True)
+                    else:
+                        dev[k] = v
+                ev = torch.cuda.Event()
+                ev.record(self._stream)
+            self._queue.put((dev, ev))
+
+    def next(self):
+        dev, ev = self._queue.get()
+        # make the COMPUTE stream wait for the copy — no host sync
+        torch.cuda.current_stream().wait_event(ev)
+        return dev
+
+    def close(self) -> None:
+        self._stop = True
+
+
 class Wrapper(nn.Module):
 
     def __init__(self, model: nn.Module, compile_mode: str = 'disable') -> None:
@@ -94,6 +149,7 @@ class DDPWraper(nn.Module):
     def __init__(self, model: nn.Module, compile_mode: str = 'disable', find_unused: bool = True, bf16_grads: bool = False) -> None:
         super().__init__()
         if get_world_size() > 1:
+            logger.critical(f'DDP options: find_unused={find_unused} bf16_grads={bf16_grads}')
             self.model = DDP(
                 model.to(get_default_device()),
                 find_unused_parameters=find_unused,
@@ -198,6 +254,11 @@ class DDPRunnerConfig(RunerConf):
     # compress gradient allreduce to bf16 (halves comm volume; fp32 master
     # weights are untouched — only the wire format changes)
     ddp_bf16_grads = IntArg(0, min_value=0, max_value=1)
+    # double-buffered device prefetch: a background thread fetches batch N+1
+    # and copies it to the GPU on a side stream (pinned staging) while the GPU
+    # computes step N. Removes the serialized fetch+H2D segments from the step
+    # wall (measured ~40-120ms/step). Tensor-only batches.
+    device_prefetch = IntArg(0, min_value=0, max_value=1)
     model_precision = OptionArg(options=['fp32', 'fp16', 'bf16'], default='fp32')
     use_amp = BoolArg(default=False)
     amp_precision = OptionArg(options=['fp16', 'bf16'], default='fp16')
@@ -628,13 +689,40 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                         self.model.set_requires_gradient_sync(True, recurse=True)
 
                 # compute loss for each sub_batch
+                import time as _time
+                _tf0 = _time.perf_counter()
+                if self.config.device_prefetch.value():
+                    if not hasattr(self, '_prefetchers'):
+                        self._prefetchers = {}
+                    pf = self._prefetchers.get(task_id)
+                    if pf is None:
+                        pf = _DevicePrefetcher(
+                            self.train_data_loaders[task_id],
+                            get_default_device(),
+                            self.config.model_precision.value(),
+                        )
+                        self._prefetchers[task_id] = pf
+                    _dev_batch = pf.next()
+                    _tf1 = _tf2 = _time.perf_counter()
+                else:
+                    _raw_batch = self._next_train_batch(task_id)
+                    _tf1 = _time.perf_counter()
+                    _dev_batch = self._batch_to_device(_raw_batch)
+                    _tf2 = _time.perf_counter()
+                if not hasattr(self, '_phase_acc'):
+                    self._phase_acc = [0.0, 0.0, 0.0, 0]
+                self._phase_acc[0] += _tf1 - _tf0
+                self._phase_acc[1] += _tf2 - _tf1
+                _push_t2 = True
+                _tf2b = _time.perf_counter()
                 subbatch_result = task.train_step(
                     model=self.model, # type: ignore
-                    batch=self._batch_to_device(self._next_train_batch(task_id)),
+                    batch=_dev_batch,
                     step=self.step, 
                     device=get_local_rank(),
                     acc_step=acc_idx,
                 )
+                self._phase_acc[2] += _time.perf_counter() - _tf2b
                 if isinstance(subbatch_result, torch.Tensor):
                     subbatch_result = {'loss': subbatch_result}
                 if 'loss' not in subbatch_result:
@@ -659,6 +747,15 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 else:
                     loss.backward()
 
+        if log_this and getattr(self, '_phase_acc', None):
+            n = max(self._phase_acc[3], 1)
+            logger.critical(
+                f'[timing] fetch={self._phase_acc[0]/n*1000:.1f}ms '
+                f'h2d={self._phase_acc[1]/n*1000:.1f}ms '
+                f'traincall={self._phase_acc[2]/n*1000:.1f}ms per-step (over {n} steps)')
+            self._phase_acc = [0.0, 0.0, 0.0, 0]
+        if getattr(self, '_phase_acc', None) is not None:
+            self._phase_acc[3] += 1
         if log_this:
             running_loss = running_loss_t.item() if running_loss_t is not None else 0.0
             running_loss = dist_avg(running_loss)
@@ -780,10 +877,20 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         else:
             raise ValueError(f'Unknown stop metric: {stop_metric}. Please choose from "step" and "epoch".')
 
+        # batch bar updates to the metric sync cadence so every visible number
+        # (step count, rate, loss) advances together on log steps instead of
+        # the count ticking under a frozen loss
+        _pbar_pending = 0
+        _msf = self.config.metric_sync_freq.value() or 1
         while not self._should_stop():
             self._one_train_step()
             if stop_metric == 'step':
-                self._pbar_train.update(1)
+                _pbar_pending += 1
+                # step was incremented inside _one_train_step; -1 realigns with
+                # the log_this cadence so the bar and the loss refresh together
+                if (self.step - 1) % _msf == 0:
+                    self._pbar_train.update(_pbar_pending)
+                    _pbar_pending = 0
             elif stop_metric == 'epoch':
                 current_epoch = self.epoch
                 if current_epoch > self._last_epoch:
@@ -792,6 +899,8 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             else:
                 raise ValueError(f'Unknown stop metric: {stop_metric}. Please choose from "step" and "epoch".')
 
+        if _pbar_pending:
+            self._pbar_train.update(_pbar_pending)
         self.test()
         self._pbar_train.close()
 
