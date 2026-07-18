@@ -259,6 +259,11 @@ class DDPRunnerConfig(RunerConf):
     # computes step N. Removes the serialized fetch+H2D segments from the step
     # wall (measured ~40-120ms/step). Tensor-only batches.
     device_prefetch = IntArg(0, min_value=0, max_value=1)
+    # diagnostic: log per-step wall time split into fetch / h2d / traincall
+    # segments every metric_sync_freq steps. fetch = waiting on the loader,
+    # h2d = host-to-device copy (0 with device_prefetch), traincall = the
+    # task.train_step call including any GPU-queue wait it absorbs.
+    step_timing = IntArg(0, min_value=0, max_value=1)
     model_precision = OptionArg(options=['fp32', 'fp16', 'bf16'], default='fp32')
     use_amp = BoolArg(default=False)
     amp_precision = OptionArg(options=['fp16', 'bf16'], default='fp16')
@@ -709,20 +714,21 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                     _tf1 = _time.perf_counter()
                     _dev_batch = self._batch_to_device(_raw_batch)
                     _tf2 = _time.perf_counter()
-                if not hasattr(self, '_phase_acc'):
-                    self._phase_acc = [0.0, 0.0, 0.0, 0]
-                self._phase_acc[0] += _tf1 - _tf0
-                self._phase_acc[1] += _tf2 - _tf1
-                _push_t2 = True
+                if self.config.step_timing.value():
+                    if not hasattr(self, '_phase_acc'):
+                        self._phase_acc = [0.0, 0.0, 0.0, 0]
+                    self._phase_acc[0] += _tf1 - _tf0
+                    self._phase_acc[1] += _tf2 - _tf1
                 _tf2b = _time.perf_counter()
                 subbatch_result = task.train_step(
                     model=self.model, # type: ignore
                     batch=_dev_batch,
-                    step=self.step, 
+                    step=self.step,
                     device=get_local_rank(),
                     acc_step=acc_idx,
                 )
-                self._phase_acc[2] += _time.perf_counter() - _tf2b
+                if self.config.step_timing.value():
+                    self._phase_acc[2] += _time.perf_counter() - _tf2b
                 if isinstance(subbatch_result, torch.Tensor):
                     subbatch_result = {'loss': subbatch_result}
                 if 'loss' not in subbatch_result:
