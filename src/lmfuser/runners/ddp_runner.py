@@ -63,6 +63,17 @@ def _compile_kwargs(compile_mode: str) -> dict:
     return {} if compile_mode == 'default' else {'mode': compile_mode}
 
 
+class _TqdmLogHandler(logging.Handler):
+    """Route logging through tqdm.write so log lines print above the progress
+    bar instead of tearing through it mid-refresh."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
 class _DevicePrefetcher:
     """Background fetch + side-stream H2D double buffering over a dataloader.
 
@@ -792,8 +803,11 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 except:
                     continue
                 self.step_log({f'{task.__class__.__name__}/train/{k}': avg})
-            self._pbar_train.set_description(
-                f'train loss: {running_loss:.3g}', refresh=True
+            # the sampled step is part of the label: loss refreshes every
+            # metric_sync_freq steps while the bar ticks every step, and an
+            # unlabeled value reads as a frozen metric
+            self._pbar_train.set_postfix_str(
+                f'loss={running_loss:.3g}@{self.step}', refresh=True
             )
 
         grad_norm_clip_val = self.config.grad_norm_clip.value()
@@ -877,6 +891,16 @@ class DDPRunner(Runner[DDPRunnerConfig]):
     def train(self, *args: Any, **kwargs: Any) -> None:
         self.eval() # evaluate first
         self._prepare_train()
+
+        # route log lines through tqdm.write for the training run so they
+        # print cleanly above the bar (plain StreamHandlers tear through it)
+        root_logger = logging.getLogger()
+        if not any(isinstance(h, _TqdmLogHandler) for h in root_logger.handlers):
+            tqdm_handler = _TqdmLogHandler()
+            tqdm_handler.setFormatter(logging.Formatter(logging.BASIC_FORMAT))
+            for h in [x for x in root_logger.handlers if type(x) is logging.StreamHandler]:
+                root_logger.removeHandler(h)
+            root_logger.addHandler(tqdm_handler)
 
         self._last_epoch = self.epoch
         stop_metric = self.config.stop_by.value()
