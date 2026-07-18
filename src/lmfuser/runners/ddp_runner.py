@@ -181,6 +181,11 @@ class DDPRunnerConfig(RunerConf):
     # execution path must be declared in the YAML, never auto-detected.
     # NOTE 'disable' not 'off': YAML 1.1 parses bare off/on/yes/no as booleans
     compile_mode = OptionArg(default='disable', options=['disable', 'default', 'reduce-overhead'])
+    # gather/log training metrics every N steps. At freq=1 the per-step cost is
+    # substantial for fast steps: a metrics all_gather + a dist_avg collective +
+    # ~6 wandb/logger calls + .item() syncs + a barrier — about half the step
+    # time for a 116M model. Logged values are point samples at the logged step.
+    metric_sync_freq = IntArg(1, min_value=1)
     model_precision = OptionArg(options=['fp32', 'fp16', 'bf16'], default='fp32')
     use_amp = BoolArg(default=False)
     amp_precision = OptionArg(options=['fp16', 'bf16'], default='fp16')
@@ -577,6 +582,9 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         # calculate loss
         running_loss: float = 0.0
+        running_loss_t = None
+        _msf = self.config.metric_sync_freq.value() or 1
+        log_this = (self.step % _msf == 0)
         batch_datas: defaultdict[Hashable, List[float]] = defaultdict(list)
         subbatch_result_lst: list[Batch] = []
         for acc_idx in range(self.config._num_acc_steps):
@@ -621,7 +629,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 subbatch_result_lst.append(subbatch_result) # type: ignore
                 assert isinstance(loss, Tensor)
                 loss = loss / self.config._num_acc_steps
-                running_loss += loss.item()
+                running_loss_t = loss.detach() if running_loss_t is None else running_loss_t + loss.detach()
                 for k, v in subbatch_result.items():
                     if k == 'loss':
                         continue
@@ -635,29 +643,33 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 else:
                     loss.backward()
 
-        running_loss = dist_avg(running_loss)
-        self.step_log({f'{task.__class__.__name__}/train/loss': running_loss})
-        self.step_log({'train/epoch': self.epoch})
-        for k, v in batch_datas.items():
-            try:
-                avg = sum(v) / len(v)
-            except:
-                continue
-            self.step_log({f'{task.__class__.__name__}/train/{k}': avg})
-        self._pbar_train.set_description(
-            f'train loss: {running_loss:.3g}', refresh=True
-        )
+        if log_this:
+            running_loss = running_loss_t.item() if running_loss_t is not None else 0.0
+            running_loss = dist_avg(running_loss)
+            self.step_log({f'{task.__class__.__name__}/train/loss': running_loss})
+            self.step_log({'train/epoch': self.epoch})
+        if log_this:
+            for k, v in batch_datas.items():
+                try:
+                    avg = sum(v) / len(v)
+                except:
+                    continue
+                self.step_log({f'{task.__class__.__name__}/train/{k}': avg})
+            self._pbar_train.set_description(
+                f'train loss: {running_loss:.3g}', refresh=True
+            )
 
         grad_norm_clip_val = self.config.grad_norm_clip.value()
         if grad_norm_clip_val is not None:
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
-            norm = clip_grad_norm_(
+            norm_t = clip_grad_norm_(
                 parameters=self.model.parameters(),  # type: ignore
                 max_norm=grad_norm_clip_val
-            ).item()
-            norm = dist_avg(norm)
-            self.step_log({f'{task.__class__.__name__}/train/grad_norm': norm})
+            )
+            if log_this:
+                norm = dist_avg(norm_t.item())
+                self.step_log({f'{task.__class__.__name__}/train/grad_norm': norm})
 
         num_hot_params = 0
         num_freeze_params = 0
@@ -671,12 +683,13 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         if num_total_params == 0:
             raise RuntimeError('The model contains no parameters.')
 
-        self.step_log({
-            f'{task.__class__.__name__}/train/num_hot_params': num_hot_params,
-            f'{task.__class__.__name__}/train/num_freeze_params': num_freeze_params,
-            f'{task.__class__.__name__}/train/num_total_params': num_total_params,
-            f'{task.__class__.__name__}/train/hot_ratio': num_hot_params / num_total_params,
-        })
+        if log_this:
+            self.step_log({
+                f'{task.__class__.__name__}/train/num_hot_params': num_hot_params,
+                f'{task.__class__.__name__}/train/num_freeze_params': num_freeze_params,
+                f'{task.__class__.__name__}/train/num_total_params': num_total_params,
+                f'{task.__class__.__name__}/train/hot_ratio': num_hot_params / num_total_params,
+            })
 
         if self.scaler is not None:
             self.scaler.step(self.optimizer)
@@ -688,21 +701,22 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             current_lr = current_lr[0]
         self.step_log(
             {f'{task.__class__.__name__}/train/learning_rate': current_lr}
-        )
+        ) if log_this else None
         self.scheduler.step()
 
-        other_step_results = defaultdict(list)
-        for r in subbatch_result_lst:
-            for k, v in r.items():
-                if isinstance(v, (float, int)):
-                    other_step_results[k].append(float(v))
-        all_other_step_results = batch_all_gather(other_step_results)
-        for k, v in all_other_step_results.items():
-            try:
-                avg = sum(v) / len(v)
-            except:
-                continue
-            self.step_log({f'{task.__class__.__name__}/train/{k}': avg})
+        if log_this:
+            other_step_results = defaultdict(list)
+            for r in subbatch_result_lst:
+                for k, v in r.items():
+                    if isinstance(v, (float, int)):
+                        other_step_results[k].append(float(v))
+            all_other_step_results = batch_all_gather(other_step_results)
+            for k, v in all_other_step_results.items():
+                try:
+                    avg = sum(v) / len(v)
+                except:
+                    continue
+                self.step_log({f'{task.__class__.__name__}/train/{k}': avg})
 
         save_step_freq = self.config.save_step_freq.value()
         assert save_step_freq is not None
@@ -712,7 +726,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             assert ckpt_path is not None
             self.save(ckpt_path)
             self._pbar_train.set_description('model saved!', True)
-        torch.distributed.barrier() if get_world_size() > 1 else ...
+            torch.distributed.barrier() if get_world_size() > 1 else ...
 
         eval_step_freq = self.config.eval_step_freq.value()
         assert eval_step_freq is not None
