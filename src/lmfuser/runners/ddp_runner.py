@@ -790,25 +790,31 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 norm = dist_avg(norm_t.item())
                 self.step_log({f'{task.__class__.__name__}/train/grad_norm': norm})
 
-        num_hot_params = 0
-        num_freeze_params = 0
-        for param in self.model.parameters(): # type: ignore
-            if param.requires_grad == False:
-                param.grad = None
-                num_freeze_params += param.numel()
-            else:
-                num_hot_params += param.numel()
-        num_total_params = num_hot_params + num_freeze_params
-        if num_total_params == 0:
-            raise RuntimeError('The model contains no parameters.')
-
+        # clearing stale grads on frozen params must run every step (tasks that
+        # flip requires_grad between steps rely on it), but the numel counting
+        # only feeds logs — do it on log steps only
         if log_this:
+            num_hot_params = 0
+            num_freeze_params = 0
+            for param in self.model.parameters(): # type: ignore
+                if param.requires_grad == False:
+                    param.grad = None
+                    num_freeze_params += param.numel()
+                else:
+                    num_hot_params += param.numel()
+            num_total_params = num_hot_params + num_freeze_params
+            if num_total_params == 0:
+                raise RuntimeError('The model contains no parameters.')
             self.step_log({
                 f'{task.__class__.__name__}/train/num_hot_params': num_hot_params,
                 f'{task.__class__.__name__}/train/num_freeze_params': num_freeze_params,
                 f'{task.__class__.__name__}/train/num_total_params': num_total_params,
                 f'{task.__class__.__name__}/train/hot_ratio': num_hot_params / num_total_params,
             })
+        else:
+            for param in self.model.parameters(): # type: ignore
+                if param.requires_grad == False:
+                    param.grad = None
 
         if self.scaler is not None:
             self.scaler.step(self.optimizer)
