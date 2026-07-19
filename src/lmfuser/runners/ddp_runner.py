@@ -164,6 +164,26 @@ class _DevicePrefetcher:
         self._thread.join(timeout=5.0)
 
 
+def _as_log_scalar(v: Any) -> float | None:
+    """A metric value reduced to a float for logging, or None if it is not a
+    scalar.
+
+    float() is what actually decides — it accepts python and numpy scalars,
+    0-dim and single-element tensors, and rejects lists and multi-element
+    tensors — so attempt it rather than enumerate accepted types. The old
+    `isinstance(v, (float, int))` test silently dropped numpy.float32, numpy
+    ints, and 0-dim/1-element tensors from wandb, while numpy.float64 slipped
+    through only because it subclasses float. str/bytes are excluded so a
+    numeric-looking string is not quietly parsed into a metric.
+    """
+    if isinstance(v, (str, bytes)):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 class Wrapper(nn.Module):
 
     def __init__(self, model: nn.Module, compile_mode: str = 'disable') -> None:
@@ -921,10 +941,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 for k, v in subbatch_result.items():
                     if k == 'loss':
                         continue
-                    if isinstance(v, (float, int)):
-                        batch_datas[k].append(float(v))
-                    elif isinstance(v, (list)) and len(v) > 0 and isinstance(v[0], (float, int)):
-                        batch_datas[k].extend([float(i) for i in v]) # type: ignore
+                    scalar = _as_log_scalar(v)
+                    if scalar is not None:
+                        batch_datas[k].append(scalar)
+                    elif isinstance(v, (list, tuple)) and len(v) > 0:
+                        floats = [s for s in (_as_log_scalar(i) for i in v)
+                                  if s is not None]
+                        # all-or-nothing: a partially-convertible list is a type
+                        # confusion, not a metric — logging half of it silently
+                        # would be worse than dropping it.
+                        if len(floats) == len(v):
+                            batch_datas[k].extend(floats)
 
                 if self.scaler is not None:
                     self.scaler.scale(loss).backward()
@@ -1024,8 +1051,9 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             other_step_results = defaultdict(list)
             for r in subbatch_result_lst:
                 for k, v in r.items():
-                    if isinstance(v, (float, int)):
-                        other_step_results[k].append(float(v))
+                    scalar = _as_log_scalar(v)
+                    if scalar is not None:
+                        other_step_results[k].append(scalar)
             all_other_step_results = batch_all_gather(other_step_results)
             for k, v in all_other_step_results.items():
                 try:
@@ -1123,7 +1151,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             if get_world_size() > 1:
                 if isinstance(self.model, (DDPWraper, Wrapper)):
                     stack.enter_context(self.model.model.no_sync())
-                elif isinstance(self.model, FSDPModule):
+                elif isinstance(self.model, FSDP2Wrapper):
                     self.model.set_requires_gradient_sync(False, recurse=True)
             for batch in tqdm(
                 dataloader,
@@ -1174,7 +1202,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         saved = bool(ckpt_dir) and (Path(str(ckpt_dir)) / str(self.step)).is_dir()
         self._all_eval_results[task.__class__.__name__].append(
             {'step': self.step, 'metrics': metrics, 'saved': saved})
-        if isinstance(self.model, FSDPModule):
+        if isinstance(self.model, FSDP2Wrapper):
             self.model.set_requires_gradient_sync(True, recurse=True)
 
     def _test_one_task(self, task_id: int, **kwargs: Any) -> None:
@@ -1229,7 +1257,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             if get_world_size() > 1:
                 if isinstance(self.model, (DDPWraper, Wrapper)):
                     stack.enter_context(self.model.model.no_sync())
-                elif isinstance(self.model, FSDPModule):
+                elif isinstance(self.model, FSDP2Wrapper):
                     self.model.set_requires_gradient_sync(False, recurse=True)
             for batch in tqdm(
                 dataloader,
@@ -1272,7 +1300,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self.step_log({f'{task.__class__.__name__}/test/{k}': v})
 
         self._test_results[task.__class__.__name__] = {'step': self.step, 'metrics': metrics}
-        if isinstance(self.model, FSDPModule):
+        if isinstance(self.model, FSDP2Wrapper):
             self.model.set_requires_gradient_sync(True, recurse=True)
 
     def eval(self, *args: Any, **kwargs: Any) -> None:

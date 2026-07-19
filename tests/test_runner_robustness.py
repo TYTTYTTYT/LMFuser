@@ -190,6 +190,48 @@ def test_pre_epoch_is_not_double_counted_on_resume() -> None:
     print('PASS 7: pre_epoch is carried only when the data stream restarts')
 
 
+def test_log_scalar_accepts_what_float_accepts() -> None:
+    """Metric filtering must attempt float(), not enumerate (float, int).
+
+    The isinstance test silently dropped numpy.float32, numpy ints, and 0-dim
+    and single-element tensors from the logs, while numpy.float64 slipped
+    through only as a float subclass. It also must not parse numeric strings.
+    """
+    import numpy as np
+    import torch
+    from lmfuser.runners.ddp_runner import _as_log_scalar
+
+    assert _as_log_scalar(0.5) == 0.5
+    assert _as_log_scalar(3) == 3.0
+    assert _as_log_scalar(np.float32(0.5)) == 0.5
+    assert _as_log_scalar(np.float64(0.5)) == 0.5
+    assert _as_log_scalar(np.int64(7)) == 7.0
+    assert _as_log_scalar(torch.tensor(0.5)) == 0.5
+    assert _as_log_scalar(torch.tensor([0.5])) == 0.5
+    # not scalars
+    assert _as_log_scalar(torch.tensor([0.5, 0.6])) is None
+    assert _as_log_scalar([1, 2]) is None
+    assert _as_log_scalar('foo') is None
+    assert _as_log_scalar('3.5') is None      # do not parse numeric strings
+    assert _as_log_scalar(None) is None
+    print('PASS 8: _as_log_scalar accepts exactly the scalars float() does')
+
+
+def test_eval_fsdp_dispatch_matches_training() -> None:
+    """The eval/test grad-sync guards must dispatch on the same type training
+    does. self.model is always an FSDP2Wrapper; the eval sites tested the stale
+    FSDPModule, so set_requires_gradient_sync never fired there under fsdp2.
+    """
+    src = open(os.path.join(os.path.dirname(__file__), '..', 'src', 'lmfuser',
+                            'runners', 'ddp_runner.py')).read()
+    assert 'isinstance(self.model, FSDPModule)' not in src, (
+        'an eval/test site still dispatches on FSDPModule, which self.model '
+        'never is — it is always an FSDP2Wrapper')
+    # the legitimate check on the LOCAL raw model before wrapping stays
+    assert 'isinstance(model, FSDPModule)' in src
+    print('PASS 9: eval/test fsdp dispatch matches the training sites')
+
+
 if __name__ == '__main__':
     test_seed_is_deterministic_across_processes()
     test_seed_survives_a_resume()
@@ -198,4 +240,6 @@ if __name__ == '__main__':
     test_state_loads_on_cpu()
     test_epoch_takes_the_slowest_task_and_the_right_weight()
     test_pre_epoch_is_not_double_counted_on_resume()
+    test_log_scalar_accepts_what_float_accepts()
+    test_eval_fsdp_dispatch_matches_training()
     print('ALL PASS')
