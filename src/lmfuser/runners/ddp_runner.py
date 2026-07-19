@@ -251,8 +251,12 @@ class FSDP2Wrapper(nn.Module):
         except:
             return self.model.__getattribute__(name)
 
-    def __call__(self, *args: Any, **kwds: Any) -> Any:
-        return self.model(*args, **kwds) # type: ignore
+    # NOTE: no __call__ override. It used to return self.model(...), which
+    # bypassed forward() — so the compiled callable built above was never
+    # invoked (compile_mode was a silent no-op under fsdp2, while still
+    # logging "torch.compile enabled") and any hook registered on the wrapper
+    # never fired. nn.Module.__call__ dispatches to forward() and is what the
+    # DDP wrapper already relies on.
 
 
 class DDPRunnerConfig(RunerConf):
@@ -475,9 +479,16 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         You can modify this fuction to control the task scheduler.
         Be sure that all ranks are selecting the same task at the same time.
         '''
-        return self.task_rand_g.choices(
+        # Return the task's own index, not its position in train_task_idxs:
+        # callers use this to address self.tasks / self.train_data_loaders,
+        # which are indexed globally. The two coincide only when the trainable
+        # tasks happen to come first — with an eval-only task before a
+        # trainable one this trained the wrong task and then crashed on its
+        # missing dataloader.
+        position = self.task_rand_g.choices(
             list(range(len(self.train_task_idxs))), weights=self.train_task_weights, k=1
         )[0]
+        return self.train_task_idxs[position]
 
     def sample_eval_task_id(self) -> int:
         '''
@@ -485,9 +496,10 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         You can modify this fuction to control the task scheduler.
         Be sure that all ranks are selecting the same task at the same time.
         '''
-        return self.task_rand_g.choices(
+        position = self.task_rand_g.choices(
             list(range(len(self.eval_task_idxs))), weights=self.eval_task_weights, k=1
         )[0]
+        return self.eval_task_idxs[position]
 
     @property
     def fsdp_kwargs(self) -> dict:
@@ -568,8 +580,13 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 model = self.model_loader.load_model()
                 model.load_state_dict(full_states)
 
+            # the INNER model, matching set_optimizer_state_dict on the resume
+            # path: passing the wrapper prefixes every parameter FQN with
+            # "model.", and the two sides then disagree — every fsdp2 resume
+            # died with "Missing optimizer state for parameter ...", and
+            # strict=False silently restored nothing at all
             optim_states = get_optimizer_state_dict(
-                model=self.model, # type: ignore
+                model=self.model.model, # type: ignore
                 optimizers=self.optimizer,
                 options=StateDictOptions(
                     full_state_dict=True,
@@ -1107,8 +1124,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 batch_list.append(result)
 
             if len(batch_list) == 0:
-                raise RuntimeError(f'No eval data found in rank {get_global_rank()} '
-                                f'for task {task.__class__.__name__}')
+                # A rank with an empty slice must NOT raise here: every other
+                # rank is heading into batch_all_gather below, and a rank that
+                # leaves instead of entering it hangs them all — under NCCL
+                # until the watchdog fires, or forever. Contribute nothing and
+                # let the collective complete; an empty result surfaces as a
+                # metric error afterwards, on every rank at once.
+                logger.warning(
+                    f'no eval data in rank {get_global_rank()} for task '
+                    f'{task.__class__.__name__}; contributing nothing to the gather'
+                )
+                batch_list = [{}]
             cat_result = batch_list[0]
             for batch in batch_list[1:]:
                 for k, v in batch.items():
@@ -1122,7 +1148,13 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         if task.__class__.__name__ not in self._all_eval_results:
             self._all_eval_results[task.__class__.__name__] = []
-        self._all_eval_results[task.__class__.__name__].append({'step': self.step, 'metrics': metrics})
+        # `saved` lets checkpoint selection tell an eval that can be reloaded
+        # from one that cannot: eval_step_freq and save_step_freq are
+        # independent, so most evals happen at steps with nothing on disk.
+        ckpt_dir = self.config.checkpoint_directory.value()
+        saved = bool(ckpt_dir) and (Path(str(ckpt_dir)) / str(self.step)).is_dir()
+        self._all_eval_results[task.__class__.__name__].append(
+            {'step': self.step, 'metrics': metrics, 'saved': saved})
         if isinstance(self.model, FSDPModule):
             self.model.set_requires_gradient_sync(True, recurse=True)
 
@@ -1139,7 +1171,35 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         if test_model_path is not None:
             if isinstance(test_model_path, int):
                 test_model_path = Path(ckpt_path) / str(test_model_path)
-            
+
+            # A task picks the best step by DEV METRIC, but eval runs on its own
+            # schedule and most eval steps have no checkpoint on disk. Loading
+            # a path that isn't there kills the run after all the training is
+            # already paid for, so fall back to the best step that was saved.
+            if not Path(test_model_path).is_dir():
+                results = self._all_eval_results.get(task.__class__.__name__, [])
+                saved_only = [r for r in results if r.get('saved')]
+                fallback = task.set_test_model_path(ckpt_path, {
+                    task.__class__.__name__: saved_only}) if saved_only else None
+                if isinstance(fallback, int):
+                    fallback = Path(ckpt_path) / str(fallback)
+                if fallback is not None and Path(fallback).is_dir():
+                    logger.warning(
+                        f'best dev step has no checkpoint on disk '
+                        f'({test_model_path}) — eval_step_freq and '
+                        f'save_step_freq disagree. Testing the best SAVED step '
+                        f'instead: {fallback}'
+                    )
+                    test_model_path = fallback
+                else:
+                    logger.warning(
+                        f'best dev step has no checkpoint on disk '
+                        f'({test_model_path}) and no evaluated step was saved; '
+                        f'testing the in-memory model instead'
+                    )
+                    test_model_path = None
+
+        if test_model_path is not None:
             self.model_loader.model_path = test_model_path
             self._model = None
 
@@ -1170,8 +1230,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 batch_list.append(result)
 
             if len(batch_list) == 0:
-                raise RuntimeError(f'No test data found in rank {get_global_rank()} '
-                                f'for task {task.__class__.__name__}')
+                # A rank with an empty slice must NOT raise here: every other
+                # rank is heading into batch_all_gather below, and a rank that
+                # leaves instead of entering it hangs them all — under NCCL
+                # until the watchdog fires, or forever. Contribute nothing and
+                # let the collective complete; an empty result surfaces as a
+                # metric error afterwards, on every rank at once.
+                logger.warning(
+                    f'no test data in rank {get_global_rank()} for task '
+                    f'{task.__class__.__name__}; contributing nothing to the gather'
+                )
+                batch_list = [{}]
             cat_result = batch_list[0]
             for batch in batch_list[1:]:
                 for k, v in batch.items():

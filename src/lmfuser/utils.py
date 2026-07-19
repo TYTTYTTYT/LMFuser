@@ -189,13 +189,36 @@ def gather_object(local_object: T) -> list[T]:
     return gathered # type: ignore
 
 def tensor_all_gather(tensor: Tensor) -> Tensor:
+    """Gather along dim 0 across ranks, allowing different lengths.
+
+    `empty_like` per rank assumed every rank held the same number of rows.
+    That holds for a padded DistributedSampler and nowhere else: with uneven
+    eval counts gloo aborts the process and NCCL does not validate sizes at
+    all, so it silently truncates or corrupts. Sizes are exchanged first, then
+    each rank's slice is padded to the largest and trimmed back after.
+    """
     if get_world_size() <= 1:
         return tensor
-    results = [torch.empty_like(tensor, device=get_default_device()) for _ in range(dist.get_world_size())]
+    device = get_default_device()
+    src = tensor.contiguous().to(device)
 
-    dist.all_gather(results, tensor.contiguous().to(get_default_device()))
+    counts = torch.zeros(dist.get_world_size(), dtype=torch.long, device=device)
+    counts[dist.get_rank()] = src.shape[0]
+    dist.all_reduce(counts)
+    longest = int(counts.max().item())
 
-    return torch.cat(results, dim=0).to(tensor.device)
+    if src.shape[0] < longest:
+        pad = torch.zeros((longest - src.shape[0], *src.shape[1:]),
+                          dtype=src.dtype, device=device)
+        padded = torch.cat([src, pad], dim=0)
+    else:
+        padded = src
+
+    results = [torch.empty_like(padded) for _ in range(dist.get_world_size())]
+    dist.all_gather(results, padded)
+
+    trimmed = [r[:int(counts[i].item())] for i, r in enumerate(results)]
+    return torch.cat(trimmed, dim=0).to(tensor.device)
 
 def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
     """把各个rank的同一批batch数据汇总到rank0，方便计算metric或者刷库等等。
@@ -210,16 +233,30 @@ def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
     if not dist.is_initialized():
         return batch
 
+    # Agree on the key set FIRST. This issued one collective per local key in
+    # local dict order, so any rank holding a different set of keys — a task
+    # that returns a metric only on some steps, or a rank whose eval slice is
+    # empty — made a different number of collective calls and the job hung.
+    keys: list[Any] = [None] * dist.get_world_size()      # type: ignore[list-item]
+    dist.all_gather_object(keys, sorted(batch.keys(), key=repr))
+    union: list[Any] = []
+    for per_rank in keys:
+        for k in per_rank or []:
+            if k not in union:
+                union.append(k)
+    union.sort(key=repr)
+
     gathered = {}
-    for k, v_list in batch.items():
+    for k in union:
+        v_list = batch.get(k)
         if isinstance(v_list, Tensor):
             gathered[k] = tensor_all_gather(v_list)
+        elif v_list and isinstance(v_list[0], Tensor):
+            gathered[k] = tensor_all_gather(torch.cat(v_list, dim=0))
         else:
-            if isinstance(v_list[0], Tensor):
-                v_tensor = torch.cat(v_list, dim=0)
-                gathered[k] = tensor_all_gather(v_tensor)
-            else:
-                gathered[k] = gather_object(v_list)
+            # a rank without this key contributes an empty list, so every rank
+            # still makes exactly one call per key in the union
+            gathered[k] = gather_object(list(v_list) if v_list else [])
 
     return gathered
 

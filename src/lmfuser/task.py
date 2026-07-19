@@ -250,7 +250,12 @@ class TaskBase(Conf, SubclassTracer):
                 num_ranks=world_size,
                 rank_idx=rank,
                 collate_fn=self.get_collate_fn(),
-                drop_last=False
+                drop_last=False,
+                # score every row exactly once: a padded sampler
+                # repeats rows to equalise rank counts, and those
+                # duplicates are gathered into the metric, so the
+                # same checkpoint scores differently on 2 vs 4 GPUs
+                exact_pass=True
             )
         elif dataloader_type == 'empty':
             self._eval_dataloader = EmptyDataLoader(init_step=0)
@@ -320,7 +325,12 @@ class TaskBase(Conf, SubclassTracer):
                 num_ranks=world_size,
                 rank_idx=rank,
                 collate_fn=self.get_collate_fn(),
-                drop_last=False
+                drop_last=False,
+                # score every row exactly once: a padded sampler
+                # repeats rows to equalise rank counts, and those
+                # duplicates are gathered into the metric, so the
+                # same checkpoint scores differently on 2 vs 4 GPUs
+                exact_pass=True
             )
         elif dataloader_type == 'empty':
             self._test_dataloader = EmptyDataLoader(init_step=0)
