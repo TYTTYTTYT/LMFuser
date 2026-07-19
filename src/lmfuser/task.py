@@ -89,7 +89,10 @@ class TaskBase(Conf, SubclassTracer):
         assert isinstance(num, int)
         if len(self.test_data_path_list) > num:
             self.test_data_path_list = self.test_data_path_list[:num]
-            self.test_data_path_list = self.test_data_path_list[:num]
+            # was a duplicate of the line above, so shrinking the test list
+            # left the weights at their old length — paths and weights then
+            # disagreed. The train and eval monitors alongside get this right.
+            self.test_data_weights = self.test_data_weights[:num]
         elif len(self.test_data_path_list) < num:
             self.test_data_path_list += [StrArg('Enther the path to the data file.')] * (num - len(self.test_data_path_list))
             self.test_data_weights += [FloatArg(1.0, min_value=0.0, max_value=1.0)] * (num - len(self.test_data_weights))
