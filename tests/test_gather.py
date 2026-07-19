@@ -58,8 +58,34 @@ def test_ranks_disagreeing_on_a_key_kind() -> None:
     print('PASS: a key-kind disagreement completes instead of hanging')
 
 
+def test_ranks_disagreeing_on_dtype_or_key_identity() -> None:
+    """Disagreements must surface on EVERY rank at once.
+
+    Taking one rank's spec silently reinterprets another's bytes — an int64
+    rank gathering a float32 rank's rows produced 1077936128 for 3.0, which
+    reads like a plausible metric. And a key whose hash is its identity comes
+    back from pickle as a different object, so `batch.get(k)` missed on the
+    rank that held the data and every rank contributed nothing: the data
+    vanished with no error at all.
+    """
+    _run('_gather_worker_spec.py', 2, 'GATHER_SPEC_OK')
+    print('PASS: dtype disagreement and identity-hash keys raise on all ranks')
+
+
+def test_cpu_multi_rank() -> None:
+    """dist_avg and the gather must work without CUDA.
+
+    get_default_device() reports -1 for CPU, which torch rejects as a device
+    index, so multi-rank CPU training died at its first logging step.
+    """
+    _run('_gather_worker_cpu.py', 2, 'CPU_MULTIRANK_OK')
+    print('PASS: dist_avg and batch_all_gather work on CPU across ranks')
+
+
 if __name__ == '__main__':
     test_mixed_kinds_across_ranks()
     test_missing_and_empty_keys_across_four_ranks()
     test_ranks_disagreeing_on_a_key_kind()
+    test_ranks_disagreeing_on_dtype_or_key_identity()
+    test_cpu_multi_rank()
     print('ALL PASS')

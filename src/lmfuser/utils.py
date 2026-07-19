@@ -146,6 +146,13 @@ def get_default_device() -> str | int:
 
     return f'{device_type}:{get_local_rank()}'
 
+def torch_device() -> Union[str, int]:
+    """`get_default_device()` reports -1 for CPU, which torch rejects as a
+    device index. Everything that actually constructs a tensor needs this."""
+    dev = get_default_device()
+    return 'cpu' if dev == -1 else dev
+
+
 @overload
 def dist_avg(value: Tensor) -> Tensor: ...
 @overload
@@ -158,10 +165,10 @@ def dist_avg(value: Union[torch.Tensor, int, float]) -> Union[torch.Tensor, floa
     
     if isinstance(value, torch.Tensor):
         return_tensor = True
-        value = value.to(get_default_device())
+        value = value.to(torch_device())
     else:
         return_tensor = False
-        value = torch.tensor(value, device=get_default_device(), dtype=torch.float32)
+        value = torch.tensor(value, device=torch_device(), dtype=torch.float32)
         
     dist.all_reduce(value, dist.ReduceOp.SUM)
     dist.barrier()
@@ -188,13 +195,6 @@ def gather_object(local_object: T) -> list[T]:
     
     return gathered # type: ignore
 
-def torch_device() -> Union[str, int]:
-    """`get_default_device()` reports -1 for CPU, which torch rejects as a
-    device index. Everything that actually constructs a tensor needs this."""
-    dev = get_default_device()
-    return 'cpu' if dev == -1 else dev
-
-
 def tensor_all_gather(tensor: Tensor) -> Tensor:
     """Gather along dim 0 across ranks, allowing different lengths.
 
@@ -206,6 +206,9 @@ def tensor_all_gather(tensor: Tensor) -> Tensor:
     """
     if get_world_size() <= 1:
         return tensor
+    if tensor.dim() == 0:
+        # concatenating along dim 0 needs a dim 0 to exist
+        tensor = tensor.reshape(1)
     device = torch_device()
     src = tensor.contiguous().to(device)
 
@@ -263,12 +266,39 @@ def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
     dist.all_gather_object(per_rank, local)
 
     kinds: dict[Any, tuple] = {}
+    disagree: dict[Any, set] = {}
     for rank_map in per_rank:
         for k, spec in (rank_map or {}).items():
             # 'object' is also what a rank reports for an empty list, so a
             # concrete kind from any rank wins
             if k not in kinds or (kinds[k][0] == 'object' and spec[0] != 'object'):
+                if k in kinds and kinds[k][0] != 'object' and kinds[k] != spec:
+                    disagree.setdefault(k, {kinds[k]}).add(spec)
                 kinds[k] = spec
+            elif spec[0] != 'object' and spec != kinds[k]:
+                disagree.setdefault(k, {kinds[k]}).add(spec)
+    if disagree:
+        # Every rank computes this from the same gathered data, so every rank
+        # raises together — a one-sided failure here is what hangs the others.
+        # Silently taking one rank's spec reinterprets another's bytes: an
+        # int64 rank gathering a float32 rank's rows produced 1077936128 for
+        # 3.0, which reads like a plausible metric.
+        raise TypeError(
+            'ranks disagree about what these batch keys hold: '
+            + '; '.join(f'{k!r}: {sorted(v)}' for k, v in disagree.items())
+        )
+
+    # Keys travel through pickle, so a key whose hash is its identity comes
+    # back as a DIFFERENT object and `batch.get(k)` misses on the very rank
+    # that holds the data — every rank then contributes nothing and the data
+    # vanishes with no error at all.
+    missing = [k for k in batch if k not in kinds]
+    if missing:
+        raise TypeError(
+            f'batch keys {missing!r} do not survive a pickle round-trip by '
+            f'value (identity-based hash or eq?) — gathering them would '
+            f'silently discard every rank\'s data'
+        )
 
     gathered = {}
     for k in sorted(kinds, key=repr):

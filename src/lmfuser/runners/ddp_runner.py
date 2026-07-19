@@ -50,6 +50,7 @@ from ..utils import (
     get_local_rank,
     get_world_size,
     get_default_device,
+    torch_device,
     dist_init,
     dist_avg,
     batch_all_gather,
@@ -166,7 +167,7 @@ class Wrapper(nn.Module):
 
     def __init__(self, model: nn.Module, compile_mode: str = 'disable') -> None:
         super().__init__()
-        self.module = model.to(get_default_device())
+        self.module = model.to(torch_device())
         if compile_mode != 'disable':
             logger.critical(f'torch.compile enabled (mode={compile_mode})')
             self.forward = torch.compile(model.forward, **_compile_kwargs(compile_mode))
@@ -195,7 +196,7 @@ class DDPWraper(nn.Module):
         if get_world_size() > 1:
             logger.critical(f'DDP options: find_unused={find_unused} bf16_grads={bf16_grads}')
             self.model = DDP(
-                model.to(get_default_device()),
+                model.to(torch_device()),
                 find_unused_parameters=find_unused,
             )
             if bf16_grads:
@@ -685,7 +686,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                     else:
                         raise ValueError(f'Unknown model precision "{precision}"')
                 assert isinstance(batch, dict)
-                batch[key] = v.to(get_default_device()) if v.get_device() != get_default_device() else v
+                batch[key] = v.to(torch_device()) if v.get_device() != get_default_device() else v
         return batch
 
     def _prepare_train(
@@ -707,7 +708,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 for state in self.optimizer.state.values():
                     for k, v in state.items():
                         if torch.is_tensor(v):
-                            state[k] = v.to(get_default_device(), non_blocking=True)
+                            state[k] = v.to(torch_device(), non_blocking=True)
             elif isinstance(self.model, FSDP2Wrapper):
                 set_optimizer_state_dict(
                     model=self.model.model, # type: ignore
@@ -923,7 +924,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             # wandb: rank0's own segments plus the all-rank max of each — the
             # max is the diagnostic one (in DDP the slowest rank paces the
             # whole step, e.g. a data-starved rank shows up as fetch_ms_max)
-            t = torch.tensor([fetch_ms, h2d_ms, traincall_ms], device=get_default_device())
+            t = torch.tensor([fetch_ms, h2d_ms, traincall_ms], device=torch_device())
             if torch.distributed.is_initialized():
                 torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
             mx = t.tolist()
