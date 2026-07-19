@@ -36,6 +36,11 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from tqdm import tqdm
 from hyperargs import Conf, StrArg, IntArg, FloatArg, OptionArg, BoolArg
 from lmfuser_data.interfaces import Batch
+try:
+    from lmfuser_data import merge_cursors
+except ImportError:      # lmfuser-data < 0.3.7
+    def merge_cursors(into: dict, cursors: dict) -> None:  # type: ignore[misc]
+        into.update(cursors)
 import wandb
 from wandb.wandb_run import Run
 
@@ -539,7 +544,12 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                     state = rank_states[task_idx] if rank_states else None
                     if state:
                         for src, table in state.items():
-                            m.setdefault(src, {}).update(table)
+                            # the loader's own rule, not dict.update: ranks own
+                            # disjoint shards except on the round-robin
+                            # fallback, where several read the same one and
+                            # last-writer-wins silently rewinds whichever of
+                            # them was enumerated first
+                            merge_cursors(m.setdefault(src, {}), table)
                 merged.append(m or None)
             return merged
         return per_task
@@ -755,6 +765,28 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         epochs = [loader.epoch for loader in self.train_data_loaders if loader is not None]
         return max(epochs) + self.pre_epoch
 
+    def _pbar_status(self, **fields: Any) -> None:
+        """Update named markers shown after the progress bar.
+
+        Everything here is a point sample of something that does not change
+        every step, so each marker carries the step it refers to. Pass None to
+        drop a marker. (set_description would put the text in front of the bar
+        and leave it there — "model saved!" fronted the bar for the 25k steps
+        until the next save.)
+        """
+        if not hasattr(self, '_pbar_fields'):
+            self._pbar_fields: dict[str, str] = {}
+        for key, value in fields.items():
+            if value is None:
+                self._pbar_fields.pop(key, None)
+            else:
+                self._pbar_fields[key] = value
+        if getattr(self, '_pbar_train', None) is not None:
+            self._pbar_train.set_postfix_str(
+                ' '.join(f'{k}={v}' for k, v in self._pbar_fields.items()),
+                refresh=True,
+            )
+
     def step_log(self, data: dict[str, Any], console: bool = True) -> None:
         self._wandb
         if get_global_rank() != 0:
@@ -904,9 +936,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             # the sampled step is part of the label: loss refreshes every
             # metric_sync_freq steps while the bar ticks every step, and an
             # unlabeled value reads as a frozen metric
-            self._pbar_train.set_postfix_str(
-                f'loss={running_loss:.3g}@{self.step}', refresh=True
-            )
+            self._pbar_status(loss=f'{running_loss:.3g}@{self.step}')
 
         grad_norm_clip_val = self.config.grad_norm_clip.value()
         if grad_norm_clip_val is not None:
@@ -971,11 +1001,14 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         save_step_freq = self.config.save_step_freq.value()
         assert save_step_freq is not None
         if self.step % save_step_freq == 0:
-            self._pbar_train.set_description('begin to save the model', True)
+            self._pbar_status(saving=str(self.step))
             ckpt_path = self.config.checkpoint_directory.value()
             assert ckpt_path is not None
             self.save(ckpt_path)
-            self._pbar_train.set_description('model saved!', True)
+            # replaces the "saving" marker rather than adding to it, and stays
+            # labelled with the step: set_description used to leave "model
+            # saved!" fronting the bar for the next 25k steps
+            self._pbar_status(saving=None, saved=str(self.step))
             torch.distributed.barrier() if get_world_size() > 1 else ...
 
         eval_step_freq = self.config.eval_step_freq.value()
