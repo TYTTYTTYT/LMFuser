@@ -11,6 +11,7 @@ import atexit
 from typing import TypeVar
 import random
 import logging
+import pickle
 
 logger = logging.getLogger(__name__)
 
@@ -253,18 +254,71 @@ def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
     # chosen from the local value, so a rank holding tensors would call
     # all_gather while a rank missing that key called all_gather_object. Same
     # count, different collective, same hang.
+    # Both checks below run BEFORE the collective and travel inside it. That
+    # is the whole point: a check that reads the LOCAL batch can fail on one
+    # rank alone, and a rank that raises here has already left the collective
+    # its peers are still waiting in — a clean error on one rank, a NCCL
+    # watchdog hang on every other. Anything that can reject the gather has to
+    # be decided from data every rank holds.
     local: dict[Any, tuple] = {}
+    ragged: list[str] = []
     for k, v in batch.items():
         if isinstance(v, Tensor):
             local[k] = ('tensor', tuple(v.shape[1:]), str(v.dtype))
         elif isinstance(v, (list, tuple)) and len(v) > 0 and isinstance(v[0], Tensor):
-            local[k] = ('tensor_list', tuple(v[0].shape[1:]), str(v[0].dtype))
+            # The spec used to be sampled from v[0] alone, so a list whose
+            # tensors disagree past dim 0 produced a spec every rank AGREED
+            # with — and then torch.cat below raised on this rank only. Check
+            # the whole list here; cat(dim=0) needs matching trailing dims and
+            # a single dtype, which is exactly what this compares.
+            tails = {tuple(t.shape[1:]) if isinstance(t, Tensor) else None for t in v}
+            dtypes = {str(t.dtype) if isinstance(t, Tensor) else None for t in v}
+            if len(tails) > 1 or len(dtypes) > 1 or None in tails:
+                ragged.append(
+                    f'{k!r} (rank {get_global_rank()}: shapes past dim 0 '
+                    f'{sorted(str(x) for x in tails)}, dtypes {sorted(str(x) for x in dtypes)})'
+                )
+                local[k] = ('object', (), '')
+            else:
+                local[k] = ('tensor_list', tuple(v[0].shape[1:]), str(v[0].dtype))
         else:
             local[k] = ('object', (), '')
 
-    per_rank: list[Any] = [None] * dist.get_world_size()   # type: ignore[list-item]
-    dist.all_gather_object(per_rank, local)
+    # Keys travel through pickle. A key whose hash is its identity comes back
+    # as a DIFFERENT object, so `batch.get(k)` misses on the very rank holding
+    # the data. Testing that here — against a local round-trip, shipped with
+    # the specs — is what makes it symmetric; the old check ran after the
+    # collective against the local `batch`, so only the rank owning the odd
+    # key raised and the rest hung.
+    restored = pickle.loads(pickle.dumps(dict.fromkeys(batch)))
+    unstable = [repr(k) for k in batch if k not in restored]
 
+    per_rank: list[Any] = [None] * dist.get_world_size()   # type: ignore[list-item]
+    dist.all_gather_object(per_rank, (local, ragged, unstable))
+
+    all_ragged = [msg for entry in per_rank for msg in (entry or ((), (), ()))[1]]
+    if all_ragged:
+        raise TypeError(
+            'these batch keys hold tensor lists that cannot be concatenated: '
+            + '; '.join(all_ragged)
+        )
+    all_unstable = [
+        f'rank {r}: {key}'
+        for r, entry in enumerate(per_rank) for key in (entry or ((), (), ()))[2]
+    ]
+    if all_unstable:
+        raise TypeError(
+            f'these batch keys do not survive a pickle round-trip by value '
+            f'(identity-based hash or eq?) — gathering them would silently '
+            f'discard the holding rank\'s data: {"; ".join(all_unstable)}'
+        )
+    per_rank = [(entry or ({}, (), ()))[0] for entry in per_rank]
+
+    # Insertion order over per_rank, which is byte-identical on every rank, so
+    # every rank issues the collectives in the SAME order. Sorting by repr()
+    # looked equivalent but a key with the default __repr__ sorts by memory
+    # address: each rank orders the keys differently and pairs one key's
+    # all_gather with another's, which hangs rather than fails.
     kinds: dict[Any, tuple] = {}
     disagree: dict[Any, set] = {}
     for rank_map in per_rank:
@@ -288,20 +342,8 @@ def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
             + '; '.join(f'{k!r}: {sorted(v)}' for k, v in disagree.items())
         )
 
-    # Keys travel through pickle, so a key whose hash is its identity comes
-    # back as a DIFFERENT object and `batch.get(k)` misses on the very rank
-    # that holds the data — every rank then contributes nothing and the data
-    # vanishes with no error at all.
-    missing = [k for k in batch if k not in kinds]
-    if missing:
-        raise TypeError(
-            f'batch keys {missing!r} do not survive a pickle round-trip by '
-            f'value (identity-based hash or eq?) — gathering them would '
-            f'silently discard every rank\'s data'
-        )
-
     gathered = {}
-    for k in sorted(kinds, key=repr):
+    for k in kinds:
         kind, shape_tail, dtype_str = kinds[k]
         v = batch.get(k)
         if kind in ('tensor', 'tensor_list'):

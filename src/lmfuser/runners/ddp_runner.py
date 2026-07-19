@@ -36,6 +36,7 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from tqdm import tqdm
 from hyperargs import Conf, StrArg, IntArg, FloatArg, OptionArg, BoolArg
 from lmfuser_data.interfaces import Batch
+from lmfuser_data.utils import slowest_epoch
 try:
     from lmfuser_data import merge_cursors
 except ImportError:      # lmfuser-data < 0.3.7
@@ -780,8 +781,25 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
     @property
     def epoch(self) -> int:
-        epochs = [loader.epoch for loader in self.train_data_loaders if loader is not None]
-        return max(epochs) + self.pre_epoch
+        """Completed epochs = the SLOWEST task's. See `slowest_epoch`.
+
+        `max` let the fastest task end the epoch for the whole run, so with
+        tasks of different sizes `stop_by: epoch` stopped while the largest
+        task had been round only partway. A task with weight 0.0 is never
+        sampled and is excluded so it cannot stall the run instead.
+        """
+        # Index by TASK id, not by position: train_data_loaders is per task
+        # and holds None for eval-only tasks, while train_task_weights is
+        # packed to the train tasks only. Zipping them pairs a loader with
+        # another task's weight as soon as any task is eval-only.
+        pairs = [
+            (self.train_data_loaders[idx].epoch, self.task_weights[idx])  # type: ignore
+            for idx in self.train_task_idxs
+        ]
+        if not pairs:
+            return self.pre_epoch
+        epochs, weights = zip(*pairs)
+        return slowest_epoch(list(epochs), list(weights)) + self.pre_epoch
 
     def _pbar_status(self, **fields: Any) -> None:
         """Update named markers shown after the progress bar.

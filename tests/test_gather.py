@@ -82,10 +82,25 @@ def test_cpu_multi_rank() -> None:
     print('PASS: dist_avg and batch_all_gather work on CPU across ranks')
 
 
+def test_rejections_are_symmetric() -> None:
+    """A rank must never raise alone.
+
+    Every check that can reject a gather has to be decided from data all ranks
+    hold, and run before the collective. Two that were not: the tensor-list
+    spec was sampled from v[0] (so a ragged list passed negotiation and failed
+    only on its holder) and the pickle round-trip check read the local batch.
+    In both cases one rank got a clean TypeError and the others got a NCCL
+    watchdog hang.
+    """
+    _run('_gather_worker_symmetry.py', 2, 'GATHER_SYMMETRY_OK')
+    print('PASS: ragged lists and one-sided odd keys raise on every rank')
+
+
 if __name__ == '__main__':
     test_mixed_kinds_across_ranks()
     test_missing_and_empty_keys_across_four_ranks()
     test_ranks_disagreeing_on_a_key_kind()
     test_ranks_disagreeing_on_dtype_or_key_identity()
     test_cpu_multi_rank()
+    test_rejections_are_symmetric()
     print('ALL PASS')
