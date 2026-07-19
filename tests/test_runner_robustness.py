@@ -1,4 +1,4 @@
-"""Failure-mode tests for DDPRunner bookkeeping (0.4.1).
+"""Failure-mode tests for DDPRunner bookkeeping (0.4.2).
 
 Run:  python tests/test_runner_robustness.py
 
@@ -21,9 +21,9 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 
-def _derive(base: int, step, stable: bool) -> int:
-    """Mirror of the runner's seed derivation."""
-    key = f'original_seed_{base}' if stable else f'original_seed_{base}|step_{step}'
+def _derive(base: int) -> int:
+    """Mirror of the runner's seed derivation (see DDPRunner.__init__)."""
+    key = f'original_seed_{base}'
     return int.from_bytes(hashlib.sha256(key.encode()).digest()[:4], 'big') & 0x7FFFFFFF
 
 
@@ -54,17 +54,43 @@ def test_seed_is_deterministic_across_processes() -> None:
           f'old hash() gave {len(old)} different values')
 
 
-def test_seed_stable_when_cursors_restored() -> None:
-    """Shard cursors index a permutation derived from the seed; folding the
-    step into it on resume would silently invalidate every cursor."""
-    fresh_step1 = _derive(42, 1, stable=False)
-    fresh_step9 = _derive(42, 900_000, stable=False)
-    assert fresh_step1 != fresh_step9, 'without cursors the seed should follow the step'
+def test_seed_survives_a_resume() -> None:
+    """Shard cursors store a row index into a permutation seeded by this value,
+    so the seed a run STARTS with must equal the seed it RESUMES with.
 
-    resumed_a = _derive(42, 1, stable=True)
-    resumed_b = _derive(42, 900_000, stable=True)
-    assert resumed_a == resumed_b, 'with cursors restored the seed must not move'
-    print('PASS 2: seed stable across a cursor-restoring resume, step-varying otherwise')
+    The comparison that matters is fresh-vs-resume. An earlier version of this
+    fix varied the key by step on a fresh run and dropped the step once
+    cursors existed — stable resume-to-resume, but every cursor written by the
+    fresh run pointed into a permutation the first restart no longer used.
+    """
+    fresh = _derive(42)
+    first_resume = _derive(42)      # after a crash at some arbitrary step
+    later_resume = _derive(42)      # and again, much later
+    assert fresh == first_resume == later_resume, (
+        'the data seed moved between a run and its restart — every restored '
+        'shard cursor now indexes a different row permutation'
+    )
+
+    # and it must actually depend on the configured seed
+    assert _derive(42) != _derive(43), 'different configured seeds collide'
+
+    # the runner must not fold the step in anywhere
+    src = open(os.path.join(os.path.dirname(__file__), '..', 'src', 'lmfuser',
+                            'runners', 'ddp_runner.py')).read()
+    block = src[src.index('self.data_seed'):src.index('self.data_seed') + 400]
+    assert 'step' not in block, 'the step is being folded into the data seed again'
+    print('PASS 2: data seed identical across fresh run and every resume')
+
+
+def test_config_seed_not_mutated() -> None:
+    """The derived seed must not overwrite config.seed: that value is written
+    into runner.json, and a derived-from-derived seed compounds per resume."""
+    src = open(os.path.join(os.path.dirname(__file__), '..', 'src', 'lmfuser',
+                            'runners', 'ddp_runner.py')).read()
+    assert 'self.config.seed = self.config.seed.parse(' not in src, \
+        'config.seed is still being overwritten with the derived value'
+    assert 'seed=self.data_seed' in src, 'loaders do not use the derived seed'
+    print('PASS 3: config.seed left as the user configured it')
 
 
 def test_checkpoint_is_atomic() -> None:
@@ -91,7 +117,7 @@ def test_checkpoint_is_atomic() -> None:
         assert numeric == ['20000'], f'staging dir leaked into the scan: {numeric}'
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    print('PASS 3: checkpoint staged then published by rename; staging dir not resumable')
+    print('PASS 4: checkpoint staged then published by rename; staging dir not resumable')
 
 
 def test_state_loads_on_cpu() -> None:
@@ -103,12 +129,13 @@ def test_state_loads_on_cpu() -> None:
         idx = src.index(f'torch.load({name}')
         call = src[idx:idx + 120]
         assert "map_location='cpu'" in call, f'torch.load({name}) lacks map_location'
-    print('PASS 4: optimizer/scheduler state deserializes on CPU')
+    print('PASS 5: optimizer/scheduler state deserializes on CPU')
 
 
 if __name__ == '__main__':
     test_seed_is_deterministic_across_processes()
-    test_seed_stable_when_cursors_restored()
+    test_seed_survives_a_resume()
+    test_config_seed_not_mutated()
     test_checkpoint_is_atomic()
     test_state_loads_on_cpu()
     print('ALL PASS')

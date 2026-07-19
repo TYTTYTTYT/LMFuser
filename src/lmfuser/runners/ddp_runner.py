@@ -126,6 +126,8 @@ class _DevicePrefetcher:
             self._queue.put(None)
 
     def next(self):
+        if self._error is not None:      # every later call, not just the first
+            raise RuntimeError('device prefetch thread died') from self._error
         item = self._queue.get()
         if item is None:
             raise RuntimeError('device prefetch thread died') from self._error
@@ -144,7 +146,15 @@ class _DevicePrefetcher:
         return dev
 
     def close(self) -> None:
+        # the thread parks in queue.put() on a full queue, so it never reaches
+        # the _stop check on its own — drain a slot to let it wake and exit
         self._stop = True
+        try:
+            while True:
+                self._queue.get_nowait()
+        except Exception:
+            pass
+        self._thread.join(timeout=5.0)
 
 
 class Wrapper(nn.Module):
@@ -357,24 +367,29 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             resume_path = config.resume_path.value()
             assert resume_path is not None, 'resume_path is None'
             self.load(resume_path)
-        # Derive the data seed deterministically. `hash()` on a str is
-        # SipHash-randomized per interpreter (PYTHONHASHSEED), so it produced a
-        # DIFFERENT seed on every rank and every restart: ranks disagreed on
-        # task sampling, and the run was irreproducible.
-        # The step is folded in only when the data stream cannot place itself:
-        # with restored shard cursors the row permutations must stay identical
-        # to the ones the cursors were recorded against.
-        _base = self.config.seed.value()
-        _stable = getattr(self, '_resume_data_states', None) is not None
-        _key = f'original_seed_{_base}' if _stable else f'original_seed_{_base}|step_{self.step}'
-        self.config.seed = self.config.seed.parse(
-            int.from_bytes(hashlib.sha256(_key.encode()).digest()[:4], 'big') & 0x7FFFFFFF
+        # Data seed, derived deterministically and ONCE per configured seed.
+        #
+        # Two properties this must have, both learned the hard way:
+        #  * identical on every rank — `hash()` on a str is PYTHONHASHSEED-
+        #    randomized, so it gave each rank a different seed (ranks then
+        #    disagreed on task sampling) and made runs irreproducible;
+        #  * identical across a resume — shard cursors store a row index into
+        #    a permutation seeded by this value, so a seed that moves between
+        #    a run and its own restart silently invalidates every cursor.
+        # It is therefore a pure function of config.seed: no step, no rank.
+        # Kept separate from config.seed so what lands in runner.json stays the
+        # value the user configured.
+        self.data_seed = (
+            int.from_bytes(
+                hashlib.sha256(f'original_seed_{self.config.seed.value()}'.encode()).digest()[:4],
+                'big',
+            ) & 0x7FFFFFFF
         )
 
         self.train_data_loaders = config.task_conf.get_train_dataloaders(
             resume_states=getattr(self, '_resume_data_states', None),
             batch_size=config.sub_batch_size.value(), # type: ignore
-            seed=config.seed.value(), # type: ignore
+            seed=self.data_seed, # type: ignore
             shuffle=config.shuffle_dataset.value(), # type: ignore
             prefetch_factor=config.row_prefetch.value(), # type: ignore
             num_workers=config.num_row_workers.value(), # type: ignore
@@ -391,7 +406,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         self.eval_data_loaders = config.task_conf.get_eval_dataloaders(
             batch_size=config.sub_batch_size.value(), # type: ignore
-            seed=config.seed.value(), # type: ignore
+            seed=self.data_seed, # type: ignore
             shuffle=config.shuffle_dataset.value(), # type: ignore
             prefetch_factor=config.row_prefetch.value(), # type: ignore
             num_workers=config.num_row_workers.value(), # type: ignore
@@ -405,7 +420,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         self.test_data_loaders = config.task_conf.get_test_dataloaders(
             batch_size=config.sub_batch_size.value(), # type: ignore
-            seed=config.seed.value(), # type: ignore
+            seed=self.data_seed, # type: ignore
             shuffle=config.shuffle_dataset.value(), # type: ignore
             prefetch_factor=config.row_prefetch.value(), # type: ignore
             num_workers=config.num_row_workers.value(), # type: ignore
