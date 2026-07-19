@@ -5,6 +5,8 @@ from collections import defaultdict
 import logging
 import os
 import random
+import hashlib
+import shutil
 from pathlib import Path
 import json
 from logging import Logger, getLogger
@@ -88,6 +90,7 @@ class _DevicePrefetcher:
         self._stream = torch.cuda.Stream(device=device)
         self._queue: _q.Queue = _q.Queue(maxsize=2)
         self._stop = False
+        self._error: BaseException | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -99,30 +102,45 @@ class _DevicePrefetcher:
         return v
 
     def _run(self) -> None:
-        it = iter(self._loader)
-        while not self._stop:
-            try:
-                batch = next(it)
-            except StopIteration:
-                it = iter(self._loader)
-                batch = next(it)
-            with torch.cuda.stream(self._stream):
-                dev = {}
-                ok = True
-                for k, v in batch.items():
-                    if isinstance(v, Tensor):
-                        v = self._cast(v)
-                        dev[k] = v.pin_memory().to(self._device, non_blocking=True)
-                    else:
-                        dev[k] = v
-                ev = torch.cuda.Event()
-                ev.record(self._stream)
-            self._queue.put((dev, ev))
+        try:
+            it = iter(self._loader)
+            while not self._stop:
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    it = iter(self._loader)
+                    batch = next(it)
+                with torch.cuda.stream(self._stream):
+                    dev = {}
+                    for k, v in batch.items():
+                        if isinstance(v, Tensor):
+                            v = self._cast(v)
+                            dev[k] = v.pin_memory().to(self._device, non_blocking=True)
+                        else:
+                            dev[k] = v
+                    ev = torch.cuda.Event()
+                    ev.record(self._stream)
+                self._queue.put((dev, ev))
+        except BaseException as e:     # never die silently: next() would block forever
+            self._error = e
+            self._queue.put(None)
 
     def next(self):
-        dev, ev = self._queue.get()
-        # make the COMPUTE stream wait for the copy — no host sync
-        torch.cuda.current_stream().wait_event(ev)
+        item = self._queue.get()
+        if item is None:
+            raise RuntimeError('device prefetch thread died') from self._error
+        dev, ev = item
+        compute = torch.cuda.current_stream()
+        # order the compute stream behind the copy...
+        compute.wait_event(ev)
+        for v in dev.values():
+            if isinstance(v, Tensor):
+                # ...and keep the allocator from recycling these blocks (they
+                # belong to the side stream's pool) until the compute stream is
+                # actually done with them. Without this the next prefetched
+                # batch can be DMA'd into the buffer the current step is still
+                # reading — silent, intermittent input corruption.
+                v.record_stream(compute)
         return dev
 
     def close(self) -> None:
@@ -339,7 +357,19 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             resume_path = config.resume_path.value()
             assert resume_path is not None, 'resume_path is None'
             self.load(resume_path)
-        self.config.seed = self.config.seed.parse(hash(f'original_seed_{self.config.seed.value()}|step_{self.step}'))
+        # Derive the data seed deterministically. `hash()` on a str is
+        # SipHash-randomized per interpreter (PYTHONHASHSEED), so it produced a
+        # DIFFERENT seed on every rank and every restart: ranks disagreed on
+        # task sampling, and the run was irreproducible.
+        # The step is folded in only when the data stream cannot place itself:
+        # with restored shard cursors the row permutations must stay identical
+        # to the ones the cursors were recorded against.
+        _base = self.config.seed.value()
+        _stable = getattr(self, '_resume_data_states', None) is not None
+        _key = f'original_seed_{_base}' if _stable else f'original_seed_{_base}|step_{self.step}'
+        self.config.seed = self.config.seed.parse(
+            int.from_bytes(hashlib.sha256(_key.encode()).digest()[:4], 'big') & 0x7FFFFFFF
+        )
 
         self.train_data_loaders = config.task_conf.get_train_dataloaders(
             resume_states=getattr(self, '_resume_data_states', None),
@@ -470,12 +500,18 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             if loader is not None and hasattr(loader, 'state_dict') else None
             for loader in self.train_data_loaders
         ]
-        if not any(s is not None for s in per_task):
+        # NOTE: the emptiness check must NOT short-circuit ahead of the
+        # all_gather_object below — that is a collective, and a rank returning
+        # early while the others enter it hangs the job until the NCCL timeout.
+        empty = not any(s is not None for s in per_task)
+        if empty and get_world_size() <= 1:
             return None
         if get_world_size() > 1:
             gathered: list[Any] = [None] * get_world_size()
             torch.distributed.all_gather_object(gathered, per_task)
-            if get_global_rank() != 0:
+            if get_global_rank() != 0 or all(
+                not any(s is not None for s in (r or [])) for r in gathered
+            ):
                 return None
             merged: list = []
             for task_idx in range(len(per_task)):
@@ -517,29 +553,34 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         data_states = self._collect_data_states()
 
         if get_global_rank() == 0:
-            path = Path(directory) / str(self.step)
-            os.makedirs(path, exist_ok=True)
-            self.model_loader.save_model(model, path) # type: ignore
+            final = Path(directory) / str(self.step)
+            # Build the checkpoint in a staging directory and publish it with a
+            # single rename. A crash midway through the multi-GB optimizer save
+            # used to leave weights without runner.json, and `load()` treats a
+            # missing runner.json as "start from step 1" — silently restarting
+            # a long run (LR warmup and all) instead of resuming it.
+            staging = Path(directory) / f'.{self.step}.incomplete'
+            shutil.rmtree(staging, ignore_errors=True)
+            os.makedirs(staging, exist_ok=True)
+
+            self.model_loader.save_model(model, staging) # type: ignore
 
             if data_states is not None:
-                tmp_path = path / 'data_state.json.tmp'
-                with open(tmp_path, 'w') as f:
+                with open(staging / 'data_state.json', 'w') as f:
                     json.dump(data_states, f)
-                os.replace(tmp_path, path / 'data_state.json')
 
-            optimizer_path = path / 'optimizer.pt'
-            torch.save(optim_states, optimizer_path)
+            torch.save(optim_states, staging / 'optimizer.pt')
+            torch.save(self.scheduler.state_dict(), staging / 'scheduler.pt')
 
-            scheduler_path = path / 'scheduler.pt'
-            torch.save(self.scheduler.state_dict(), scheduler_path)
-
-            runner_path = path / 'runner.json'
-            with open(runner_path, 'w') as f:
+            with open(staging / 'runner.json', 'w') as f:
                 f.write(json.dumps({
                     'step': self.step + 1,
                     'epoch': self.epoch,
                     'config': self.config.to_dict(),
                 }, indent=4))
+
+            shutil.rmtree(final, ignore_errors=True)   # re-save of the same step
+            os.replace(staging, final)
 
     @property
     def model(self) -> DDPWraper | FSDP2Wrapper:
@@ -1157,13 +1198,13 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         optimizer_path = Path(directory) / 'optimizer.pt'
         if optimizer_path.exists():
-            self._optimizer_states = torch.load(optimizer_path)
+            self._optimizer_states = torch.load(optimizer_path, map_location='cpu')
         else:
             logger.warning(f'optimizer.pt not found in {directory}, skip loading optimizer')
 
         scheduler_path = Path(directory) / 'scheduler.pt'
         if scheduler_path.exists():
-            self._scheduler_states = torch.load(scheduler_path)
+            self._scheduler_states = torch.load(scheduler_path, map_location='cpu')
         else:
             logger.warning(f'scheduler.pt not found in {directory}, skip loading scheduler')
 
