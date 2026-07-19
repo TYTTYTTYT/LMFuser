@@ -36,6 +36,12 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from tqdm import tqdm
 from hyperargs import Conf, StrArg, IntArg, FloatArg, OptionArg, BoolArg
 from lmfuser_data.interfaces import Batch
+from lmfuser_data.utils import slowest_epoch
+try:
+    from lmfuser_data import merge_cursors
+except ImportError:      # lmfuser-data < 0.3.7
+    def merge_cursors(into: dict, cursors: dict) -> None:  # type: ignore[misc]
+        into.update(cursors)
 import wandb
 from wandb.wandb_run import Run
 
@@ -45,6 +51,7 @@ from ..utils import (
     get_local_rank,
     get_world_size,
     get_default_device,
+    torch_device,
     dist_init,
     dist_avg,
     batch_all_gather,
@@ -126,6 +133,8 @@ class _DevicePrefetcher:
             self._queue.put(None)
 
     def next(self):
+        if self._error is not None:      # every later call, not just the first
+            raise RuntimeError('device prefetch thread died') from self._error
         item = self._queue.get()
         if item is None:
             raise RuntimeError('device prefetch thread died') from self._error
@@ -144,14 +153,42 @@ class _DevicePrefetcher:
         return dev
 
     def close(self) -> None:
+        # the thread parks in queue.put() on a full queue, so it never reaches
+        # the _stop check on its own — drain a slot to let it wake and exit
         self._stop = True
+        try:
+            while True:
+                self._queue.get_nowait()
+        except Exception:
+            pass
+        self._thread.join(timeout=5.0)
+
+
+def _as_log_scalar(v: Any) -> float | None:
+    """A metric value reduced to a float for logging, or None if it is not a
+    scalar.
+
+    float() is what actually decides — it accepts python and numpy scalars,
+    0-dim and single-element tensors, and rejects lists and multi-element
+    tensors — so attempt it rather than enumerate accepted types. The old
+    `isinstance(v, (float, int))` test silently dropped numpy.float32, numpy
+    ints, and 0-dim/1-element tensors from wandb, while numpy.float64 slipped
+    through only because it subclasses float. str/bytes are excluded so a
+    numeric-looking string is not quietly parsed into a metric.
+    """
+    if isinstance(v, (str, bytes)):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 class Wrapper(nn.Module):
 
     def __init__(self, model: nn.Module, compile_mode: str = 'disable') -> None:
         super().__init__()
-        self.module = model.to(get_default_device())
+        self.module = model.to(torch_device())
         if compile_mode != 'disable':
             logger.critical(f'torch.compile enabled (mode={compile_mode})')
             self.forward = torch.compile(model.forward, **_compile_kwargs(compile_mode))
@@ -180,7 +217,7 @@ class DDPWraper(nn.Module):
         if get_world_size() > 1:
             logger.critical(f'DDP options: find_unused={find_unused} bf16_grads={bf16_grads}')
             self.model = DDP(
-                model.to(get_default_device()),
+                model.to(torch_device()),
                 find_unused_parameters=find_unused,
             )
             if bf16_grads:
@@ -236,8 +273,12 @@ class FSDP2Wrapper(nn.Module):
         except:
             return self.model.__getattribute__(name)
 
-    def __call__(self, *args: Any, **kwds: Any) -> Any:
-        return self.model(*args, **kwds) # type: ignore
+    # NOTE: no __call__ override. It used to return self.model(...), which
+    # bypassed forward() — so the compiled callable built above was never
+    # invoked (compile_mode was a silent no-op under fsdp2, while still
+    # logging "torch.compile enabled") and any hook registered on the wrapper
+    # never fired. nn.Module.__call__ dispatches to forward() and is what the
+    # DDP wrapper already relies on.
 
 
 class DDPRunnerConfig(RunerConf):
@@ -316,14 +357,18 @@ class DDPRunnerConfig(RunerConf):
 
     @property
     def _default_precision(self) -> torch.dtype:
-        if self.model_precision == 'fp32':
-            return torch.float32
-        elif self.model_precision == 'fp16':
-            return torch.float16
-        elif self.model_precision == 'bf16':
-            return torch.bfloat16
-        else:
-            raise ValueError(self.model_precision)
+        # `model_precision` is an OptionArg, and Arg defines no __eq__, so
+        # comparing it to a str was False on every branch and this property
+        # raised for every valid value. Read the value, as _num_acc_steps does.
+        precision = self.model_precision.value()
+        try:
+            return {
+                'fp32': torch.float32,
+                'fp16': torch.float16,
+                'bf16': torch.bfloat16,
+            }[precision]
+        except KeyError:
+            raise ValueError(f'Unknown model precision "{precision}"')
 
     @property
     def _num_acc_steps(self) -> int:
@@ -357,24 +402,29 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             resume_path = config.resume_path.value()
             assert resume_path is not None, 'resume_path is None'
             self.load(resume_path)
-        # Derive the data seed deterministically. `hash()` on a str is
-        # SipHash-randomized per interpreter (PYTHONHASHSEED), so it produced a
-        # DIFFERENT seed on every rank and every restart: ranks disagreed on
-        # task sampling, and the run was irreproducible.
-        # The step is folded in only when the data stream cannot place itself:
-        # with restored shard cursors the row permutations must stay identical
-        # to the ones the cursors were recorded against.
-        _base = self.config.seed.value()
-        _stable = getattr(self, '_resume_data_states', None) is not None
-        _key = f'original_seed_{_base}' if _stable else f'original_seed_{_base}|step_{self.step}'
-        self.config.seed = self.config.seed.parse(
-            int.from_bytes(hashlib.sha256(_key.encode()).digest()[:4], 'big') & 0x7FFFFFFF
+        # Data seed, derived deterministically and ONCE per configured seed.
+        #
+        # Two properties this must have, both learned the hard way:
+        #  * identical on every rank — `hash()` on a str is PYTHONHASHSEED-
+        #    randomized, so it gave each rank a different seed (ranks then
+        #    disagreed on task sampling) and made runs irreproducible;
+        #  * identical across a resume — shard cursors store a row index into
+        #    a permutation seeded by this value, so a seed that moves between
+        #    a run and its own restart silently invalidates every cursor.
+        # It is therefore a pure function of config.seed: no step, no rank.
+        # Kept separate from config.seed so what lands in runner.json stays the
+        # value the user configured.
+        self.data_seed = (
+            int.from_bytes(
+                hashlib.sha256(f'original_seed_{self.config.seed.value()}'.encode()).digest()[:4],
+                'big',
+            ) & 0x7FFFFFFF
         )
 
         self.train_data_loaders = config.task_conf.get_train_dataloaders(
             resume_states=getattr(self, '_resume_data_states', None),
             batch_size=config.sub_batch_size.value(), # type: ignore
-            seed=config.seed.value(), # type: ignore
+            seed=self.data_seed, # type: ignore
             shuffle=config.shuffle_dataset.value(), # type: ignore
             prefetch_factor=config.row_prefetch.value(), # type: ignore
             num_workers=config.num_row_workers.value(), # type: ignore
@@ -391,7 +441,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         self.eval_data_loaders = config.task_conf.get_eval_dataloaders(
             batch_size=config.sub_batch_size.value(), # type: ignore
-            seed=config.seed.value(), # type: ignore
+            seed=self.data_seed, # type: ignore
             shuffle=config.shuffle_dataset.value(), # type: ignore
             prefetch_factor=config.row_prefetch.value(), # type: ignore
             num_workers=config.num_row_workers.value(), # type: ignore
@@ -405,7 +455,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         self.test_data_loaders = config.task_conf.get_test_dataloaders(
             batch_size=config.sub_batch_size.value(), # type: ignore
-            seed=config.seed.value(), # type: ignore
+            seed=self.data_seed, # type: ignore
             shuffle=config.shuffle_dataset.value(), # type: ignore
             prefetch_factor=config.row_prefetch.value(), # type: ignore
             num_workers=config.num_row_workers.value(), # type: ignore
@@ -451,9 +501,16 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         You can modify this fuction to control the task scheduler.
         Be sure that all ranks are selecting the same task at the same time.
         '''
-        return self.task_rand_g.choices(
+        # Return the task's own index, not its position in train_task_idxs:
+        # callers use this to address self.tasks / self.train_data_loaders,
+        # which are indexed globally. The two coincide only when the trainable
+        # tasks happen to come first — with an eval-only task before a
+        # trainable one this trained the wrong task and then crashed on its
+        # missing dataloader.
+        position = self.task_rand_g.choices(
             list(range(len(self.train_task_idxs))), weights=self.train_task_weights, k=1
         )[0]
+        return self.train_task_idxs[position]
 
     def sample_eval_task_id(self) -> int:
         '''
@@ -461,9 +518,10 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         You can modify this fuction to control the task scheduler.
         Be sure that all ranks are selecting the same task at the same time.
         '''
-        return self.task_rand_g.choices(
+        position = self.task_rand_g.choices(
             list(range(len(self.eval_task_idxs))), weights=self.eval_task_weights, k=1
         )[0]
+        return self.eval_task_idxs[position]
 
     @property
     def fsdp_kwargs(self) -> dict:
@@ -520,7 +578,12 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                     state = rank_states[task_idx] if rank_states else None
                     if state:
                         for src, table in state.items():
-                            m.setdefault(src, {}).update(table)
+                            # the loader's own rule, not dict.update: ranks own
+                            # disjoint shards except on the round-robin
+                            # fallback, where several read the same one and
+                            # last-writer-wins silently rewinds whichever of
+                            # them was enumerated first
+                            merge_cursors(m.setdefault(src, {}), table)
                 merged.append(m or None)
             return merged
         return per_task
@@ -539,8 +602,13 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 model = self.model_loader.load_model()
                 model.load_state_dict(full_states)
 
+            # the INNER model, matching set_optimizer_state_dict on the resume
+            # path: passing the wrapper prefixes every parameter FQN with
+            # "model.", and the two sides then disagree — every fsdp2 resume
+            # died with "Missing optimizer state for parameter ...", and
+            # strict=False silently restored nothing at all
             optim_states = get_optimizer_state_dict(
-                model=self.model, # type: ignore
+                model=self.model.model, # type: ignore
                 optimizers=self.optimizer,
                 options=StateDictOptions(
                     full_state_dict=True,
@@ -639,7 +707,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                     else:
                         raise ValueError(f'Unknown model precision "{precision}"')
                 assert isinstance(batch, dict)
-                batch[key] = v.to(get_default_device()) if v.get_device() != get_default_device() else v
+                batch[key] = v.to(torch_device()) if v.get_device() != get_default_device() else v
         return batch
 
     def _prepare_train(
@@ -661,7 +729,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 for state in self.optimizer.state.values():
                     for k, v in state.items():
                         if torch.is_tensor(v):
-                            state[k] = v.to(get_default_device(), non_blocking=True)
+                            state[k] = v.to(torch_device(), non_blocking=True)
             elif isinstance(self.model, FSDP2Wrapper):
                 set_optimizer_state_dict(
                     model=self.model.model, # type: ignore
@@ -733,8 +801,47 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
     @property
     def epoch(self) -> int:
-        epochs = [loader.epoch for loader in self.train_data_loaders if loader is not None]
-        return max(epochs) + self.pre_epoch
+        """Completed epochs = the SLOWEST task's. See `slowest_epoch`.
+
+        `max` let the fastest task end the epoch for the whole run, so with
+        tasks of different sizes `stop_by: epoch` stopped while the largest
+        task had been round only partway. A task with weight 0.0 is never
+        sampled and is excluded so it cannot stall the run instead.
+        """
+        # Index by TASK id, not by position: train_data_loaders is per task
+        # and holds None for eval-only tasks, while train_task_weights is
+        # packed to the train tasks only. Zipping them pairs a loader with
+        # another task's weight as soon as any task is eval-only.
+        pairs = [
+            (self.train_data_loaders[idx].epoch, self.task_weights[idx])  # type: ignore
+            for idx in self.train_task_idxs
+        ]
+        if not pairs:
+            return self.pre_epoch
+        epochs, weights = zip(*pairs)
+        return slowest_epoch(list(epochs), list(weights)) + self.pre_epoch
+
+    def _pbar_status(self, **fields: Any) -> None:
+        """Update named markers shown after the progress bar.
+
+        Everything here is a point sample of something that does not change
+        every step, so each marker carries the step it refers to. Pass None to
+        drop a marker. (set_description would put the text in front of the bar
+        and leave it there — "model saved!" fronted the bar for the 25k steps
+        until the next save.)
+        """
+        if not hasattr(self, '_pbar_fields'):
+            self._pbar_fields: dict[str, str] = {}
+        for key, value in fields.items():
+            if value is None:
+                self._pbar_fields.pop(key, None)
+            else:
+                self._pbar_fields[key] = value
+        if getattr(self, '_pbar_train', None) is not None:
+            self._pbar_train.set_postfix_str(
+                ' '.join(f'{k}={v}' for k, v in self._pbar_fields.items()),
+                refresh=True,
+            )
 
     def step_log(self, data: dict[str, Any], console: bool = True) -> None:
         self._wandb
@@ -834,10 +941,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 for k, v in subbatch_result.items():
                     if k == 'loss':
                         continue
-                    if isinstance(v, (float, int)):
-                        batch_datas[k].append(float(v))
-                    elif isinstance(v, (list)) and len(v) > 0 and isinstance(v[0], (float, int)):
-                        batch_datas[k].extend([float(i) for i in v]) # type: ignore
+                    scalar = _as_log_scalar(v)
+                    if scalar is not None:
+                        batch_datas[k].append(scalar)
+                    elif isinstance(v, (list, tuple)) and len(v) > 0:
+                        floats = [s for s in (_as_log_scalar(i) for i in v)
+                                  if s is not None]
+                        # all-or-nothing: a partially-convertible list is a type
+                        # confusion, not a metric — logging half of it silently
+                        # would be worse than dropping it.
+                        if len(floats) == len(v):
+                            batch_datas[k].extend(floats)
 
                 if self.scaler is not None:
                     self.scaler.scale(loss).backward()
@@ -855,7 +969,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             # wandb: rank0's own segments plus the all-rank max of each — the
             # max is the diagnostic one (in DDP the slowest rank paces the
             # whole step, e.g. a data-starved rank shows up as fetch_ms_max)
-            t = torch.tensor([fetch_ms, h2d_ms, traincall_ms], device=get_default_device())
+            t = torch.tensor([fetch_ms, h2d_ms, traincall_ms], device=torch_device())
             if torch.distributed.is_initialized():
                 torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
             mx = t.tolist()
@@ -885,9 +999,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             # the sampled step is part of the label: loss refreshes every
             # metric_sync_freq steps while the bar ticks every step, and an
             # unlabeled value reads as a frozen metric
-            self._pbar_train.set_postfix_str(
-                f'loss={running_loss:.3g}@{self.step}', refresh=True
-            )
+            self._pbar_status(loss=f'{running_loss:.3g}@{self.step}')
 
         grad_norm_clip_val = self.config.grad_norm_clip.value()
         if grad_norm_clip_val is not None:
@@ -939,8 +1051,9 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             other_step_results = defaultdict(list)
             for r in subbatch_result_lst:
                 for k, v in r.items():
-                    if isinstance(v, (float, int)):
-                        other_step_results[k].append(float(v))
+                    scalar = _as_log_scalar(v)
+                    if scalar is not None:
+                        other_step_results[k].append(scalar)
             all_other_step_results = batch_all_gather(other_step_results)
             for k, v in all_other_step_results.items():
                 try:
@@ -952,11 +1065,14 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         save_step_freq = self.config.save_step_freq.value()
         assert save_step_freq is not None
         if self.step % save_step_freq == 0:
-            self._pbar_train.set_description('begin to save the model', True)
+            self._pbar_status(saving=str(self.step))
             ckpt_path = self.config.checkpoint_directory.value()
             assert ckpt_path is not None
             self.save(ckpt_path)
-            self._pbar_train.set_description('model saved!', True)
+            # replaces the "saving" marker rather than adding to it, and stays
+            # labelled with the step: set_description used to leave "model
+            # saved!" fronting the bar for the next 25k steps
+            self._pbar_status(saving=None, saved=str(self.step))
             torch.distributed.barrier() if get_world_size() > 1 else ...
 
         eval_step_freq = self.config.eval_step_freq.value()
@@ -1035,7 +1151,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             if get_world_size() > 1:
                 if isinstance(self.model, (DDPWraper, Wrapper)):
                     stack.enter_context(self.model.model.no_sync())
-                elif isinstance(self.model, FSDPModule):
+                elif isinstance(self.model, FSDP2Wrapper):
                     self.model.set_requires_gradient_sync(False, recurse=True)
             for batch in tqdm(
                 dataloader,
@@ -1055,8 +1171,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 batch_list.append(result)
 
             if len(batch_list) == 0:
-                raise RuntimeError(f'No eval data found in rank {get_global_rank()} '
-                                f'for task {task.__class__.__name__}')
+                # A rank with an empty slice must NOT raise here: every other
+                # rank is heading into batch_all_gather below, and a rank that
+                # leaves instead of entering it hangs them all — under NCCL
+                # until the watchdog fires, or forever. Contribute nothing and
+                # let the collective complete; an empty result surfaces as a
+                # metric error afterwards, on every rank at once.
+                logger.warning(
+                    f'no eval data in rank {get_global_rank()} for task '
+                    f'{task.__class__.__name__}; contributing nothing to the gather'
+                )
+                batch_list = [{}]
             cat_result = batch_list[0]
             for batch in batch_list[1:]:
                 for k, v in batch.items():
@@ -1070,8 +1195,14 @@ class DDPRunner(Runner[DDPRunnerConfig]):
 
         if task.__class__.__name__ not in self._all_eval_results:
             self._all_eval_results[task.__class__.__name__] = []
-        self._all_eval_results[task.__class__.__name__].append({'step': self.step, 'metrics': metrics})
-        if isinstance(self.model, FSDPModule):
+        # `saved` lets checkpoint selection tell an eval that can be reloaded
+        # from one that cannot: eval_step_freq and save_step_freq are
+        # independent, so most evals happen at steps with nothing on disk.
+        ckpt_dir = self.config.checkpoint_directory.value()
+        saved = bool(ckpt_dir) and (Path(str(ckpt_dir)) / str(self.step)).is_dir()
+        self._all_eval_results[task.__class__.__name__].append(
+            {'step': self.step, 'metrics': metrics, 'saved': saved})
+        if isinstance(self.model, FSDP2Wrapper):
             self.model.set_requires_gradient_sync(True, recurse=True)
 
     def _test_one_task(self, task_id: int, **kwargs: Any) -> None:
@@ -1087,7 +1218,35 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         if test_model_path is not None:
             if isinstance(test_model_path, int):
                 test_model_path = Path(ckpt_path) / str(test_model_path)
-            
+
+            # A task picks the best step by DEV METRIC, but eval runs on its own
+            # schedule and most eval steps have no checkpoint on disk. Loading
+            # a path that isn't there kills the run after all the training is
+            # already paid for, so fall back to the best step that was saved.
+            if not Path(test_model_path).is_dir():
+                results = self._all_eval_results.get(task.__class__.__name__, [])
+                saved_only = [r for r in results if r.get('saved')]
+                fallback = task.set_test_model_path(ckpt_path, {
+                    task.__class__.__name__: saved_only}) if saved_only else None
+                if isinstance(fallback, int):
+                    fallback = Path(ckpt_path) / str(fallback)
+                if fallback is not None and Path(fallback).is_dir():
+                    logger.warning(
+                        f'best dev step has no checkpoint on disk '
+                        f'({test_model_path}) — eval_step_freq and '
+                        f'save_step_freq disagree. Testing the best SAVED step '
+                        f'instead: {fallback}'
+                    )
+                    test_model_path = fallback
+                else:
+                    logger.warning(
+                        f'best dev step has no checkpoint on disk '
+                        f'({test_model_path}) and no evaluated step was saved; '
+                        f'testing the in-memory model instead'
+                    )
+                    test_model_path = None
+
+        if test_model_path is not None:
             self.model_loader.model_path = test_model_path
             self._model = None
 
@@ -1098,7 +1257,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             if get_world_size() > 1:
                 if isinstance(self.model, (DDPWraper, Wrapper)):
                     stack.enter_context(self.model.model.no_sync())
-                elif isinstance(self.model, FSDPModule):
+                elif isinstance(self.model, FSDP2Wrapper):
                     self.model.set_requires_gradient_sync(False, recurse=True)
             for batch in tqdm(
                 dataloader,
@@ -1118,8 +1277,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
                 batch_list.append(result)
 
             if len(batch_list) == 0:
-                raise RuntimeError(f'No test data found in rank {get_global_rank()} '
-                                f'for task {task.__class__.__name__}')
+                # A rank with an empty slice must NOT raise here: every other
+                # rank is heading into batch_all_gather below, and a rank that
+                # leaves instead of entering it hangs them all — under NCCL
+                # until the watchdog fires, or forever. Contribute nothing and
+                # let the collective complete; an empty result surfaces as a
+                # metric error afterwards, on every rank at once.
+                logger.warning(
+                    f'no test data in rank {get_global_rank()} for task '
+                    f'{task.__class__.__name__}; contributing nothing to the gather'
+                )
+                batch_list = [{}]
             cat_result = batch_list[0]
             for batch in batch_list[1:]:
                 for k, v in batch.items():
@@ -1132,7 +1300,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self.step_log({f'{task.__class__.__name__}/test/{k}': v})
 
         self._test_results[task.__class__.__name__] = {'step': self.step, 'metrics': metrics}
-        if isinstance(self.model, FSDPModule):
+        if isinstance(self.model, FSDP2Wrapper):
             self.model.set_requires_gradient_sync(True, recurse=True)
 
     def eval(self, *args: Any, **kwargs: Any) -> None:
@@ -1226,6 +1394,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             with open(runner_path, 'r') as f:
                 runner_state = json.load(f)
                 self.step = int(runner_state['step'])
-                self.pre_epoch = int(runner_state['epoch'])
+                # runner.json's `epoch` is the FULL count — it was written as
+                # self.epoch, which already includes the loaders' progress.
+                # When the data stream is restored too, the loaders replay that
+                # progress and report it again, so adding it here counted every
+                # completed epoch twice, and once more for every further
+                # resume (2 + 2 = 4 after one). pre_epoch exists for the case
+                # where the stream restarts from scratch and that history would
+                # otherwise be lost; carry it only then.
+                self.pre_epoch = (
+                    0 if getattr(self, '_resume_data_states', None)
+                    else int(runner_state['epoch'])
+                )
         else:
             logger.warning(f'runner.json not found in {directory}, skip loading runner state')

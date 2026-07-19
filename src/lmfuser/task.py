@@ -89,7 +89,10 @@ class TaskBase(Conf, SubclassTracer):
         assert isinstance(num, int)
         if len(self.test_data_path_list) > num:
             self.test_data_path_list = self.test_data_path_list[:num]
-            self.test_data_path_list = self.test_data_path_list[:num]
+            # was a duplicate of the line above, so shrinking the test list
+            # left the weights at their old length — paths and weights then
+            # disagreed. The train and eval monitors alongside get this right.
+            self.test_data_weights = self.test_data_weights[:num]
         elif len(self.test_data_path_list) < num:
             self.test_data_path_list += [StrArg('Enther the path to the data file.')] * (num - len(self.test_data_path_list))
             self.test_data_weights += [FloatArg(1.0, min_value=0.0, max_value=1.0)] * (num - len(self.test_data_weights))
@@ -250,7 +253,12 @@ class TaskBase(Conf, SubclassTracer):
                 num_ranks=world_size,
                 rank_idx=rank,
                 collate_fn=self.get_collate_fn(),
-                drop_last=False
+                drop_last=False,
+                # score every row exactly once: a padded sampler
+                # repeats rows to equalise rank counts, and those
+                # duplicates are gathered into the metric, so the
+                # same checkpoint scores differently on 2 vs 4 GPUs
+                exact_pass=True
             )
         elif dataloader_type == 'empty':
             self._eval_dataloader = EmptyDataLoader(init_step=0)
@@ -320,7 +328,12 @@ class TaskBase(Conf, SubclassTracer):
                 num_ranks=world_size,
                 rank_idx=rank,
                 collate_fn=self.get_collate_fn(),
-                drop_last=False
+                drop_last=False,
+                # score every row exactly once: a padded sampler
+                # repeats rows to equalise rank counts, and those
+                # duplicates are gathered into the metric, so the
+                # same checkpoint scores differently on 2 vs 4 GPUs
+                exact_pass=True
             )
         elif dataloader_type == 'empty':
             self._test_dataloader = EmptyDataLoader(init_step=0)

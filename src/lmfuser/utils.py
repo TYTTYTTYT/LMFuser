@@ -11,6 +11,7 @@ import atexit
 from typing import TypeVar
 import random
 import logging
+import pickle
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,13 @@ def get_default_device() -> str | int:
 
     return f'{device_type}:{get_local_rank()}'
 
+def torch_device() -> Union[str, int]:
+    """`get_default_device()` reports -1 for CPU, which torch rejects as a
+    device index. Everything that actually constructs a tensor needs this."""
+    dev = get_default_device()
+    return 'cpu' if dev == -1 else dev
+
+
 @overload
 def dist_avg(value: Tensor) -> Tensor: ...
 @overload
@@ -158,10 +166,10 @@ def dist_avg(value: Union[torch.Tensor, int, float]) -> Union[torch.Tensor, floa
     
     if isinstance(value, torch.Tensor):
         return_tensor = True
-        value = value.to(get_default_device())
+        value = value.to(torch_device())
     else:
         return_tensor = False
-        value = torch.tensor(value, device=get_default_device(), dtype=torch.float32)
+        value = torch.tensor(value, device=torch_device(), dtype=torch.float32)
         
     dist.all_reduce(value, dist.ReduceOp.SUM)
     dist.barrier()
@@ -189,13 +197,39 @@ def gather_object(local_object: T) -> list[T]:
     return gathered # type: ignore
 
 def tensor_all_gather(tensor: Tensor) -> Tensor:
+    """Gather along dim 0 across ranks, allowing different lengths.
+
+    `empty_like` per rank assumed every rank held the same number of rows.
+    That holds for a padded DistributedSampler and nowhere else: with uneven
+    eval counts gloo aborts the process and NCCL does not validate sizes at
+    all, so it silently truncates or corrupts. Sizes are exchanged first, then
+    each rank's slice is padded to the largest and trimmed back after.
+    """
     if get_world_size() <= 1:
         return tensor
-    results = [torch.empty_like(tensor, device=get_default_device()) for _ in range(dist.get_world_size())]
+    if tensor.dim() == 0:
+        # concatenating along dim 0 needs a dim 0 to exist
+        tensor = tensor.reshape(1)
+    device = torch_device()
+    src = tensor.contiguous().to(device)
 
-    dist.all_gather(results, tensor.contiguous().to(get_default_device()))
+    counts = torch.zeros(dist.get_world_size(), dtype=torch.long, device=device)
+    counts[dist.get_rank()] = src.shape[0]
+    dist.all_reduce(counts)
+    longest = int(counts.max().item())
 
-    return torch.cat(results, dim=0).to(tensor.device)
+    if src.shape[0] < longest:
+        pad = torch.zeros((longest - src.shape[0], *src.shape[1:]),
+                          dtype=src.dtype, device=device)
+        padded = torch.cat([src, pad], dim=0)
+    else:
+        padded = src
+
+    results = [torch.empty_like(padded) for _ in range(dist.get_world_size())]
+    dist.all_gather(results, padded)
+
+    trimmed = [r[:int(counts[i].item())] for i, r in enumerate(results)]
+    return torch.cat(trimmed, dim=0).to(tensor.device)
 
 def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
     """把各个rank的同一批batch数据汇总到rank0，方便计算metric或者刷库等等。
@@ -210,16 +244,171 @@ def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
     if not dist.is_initialized():
         return batch
 
-    gathered = {}
-    for k, v_list in batch.items():
-        if isinstance(v_list, Tensor):
-            gathered[k] = tensor_all_gather(v_list)
-        else:
-            if isinstance(v_list[0], Tensor):
-                v_tensor = torch.cat(v_list, dim=0)
-                gathered[k] = tensor_all_gather(v_tensor)
+    # Agree on the key set AND on what kind of value each key holds, before
+    # issuing anything.
+    #
+    # This used to loop over the local dict, so a rank with a different key set
+    # — a task emitting a metric only on some steps, or a rank whose eval slice
+    # is empty — made a different NUMBER of collective calls and the job hung.
+    # Agreeing only on the keys is not enough either: the branch below is
+    # chosen from the local value, so a rank holding tensors would call
+    # all_gather while a rank missing that key called all_gather_object. Same
+    # count, different collective, same hang.
+    # Both checks below run BEFORE the collective and travel inside it. That
+    # is the whole point: a check that reads the LOCAL batch can fail on one
+    # rank alone, and a rank that raises here has already left the collective
+    # its peers are still waiting in — a clean error on one rank, a NCCL
+    # watchdog hang on every other. Anything that can reject the gather has to
+    # be decided from data every rank holds.
+    rank = get_global_rank()
+    local: dict[Any, tuple] = {}
+    prepared: dict[Any, Tensor] = {}
+    problems: list[str] = []
+
+    def _safe_repr(obj: Any) -> str:
+        try:
+            return repr(obj)
+        except Exception as exc:      # a __repr__ that raises must not decide
+            return f'<{type(obj).__name__} with an unusable __repr__: {exc!r}>'
+
+    for k, v in batch.items():
+        if isinstance(v, Tensor):
+            local[k] = ('tensor', tuple(v.shape[1:]), str(v.dtype))
+        elif isinstance(v, (list, tuple)) and len(v) > 0 and isinstance(v[0], Tensor):
+            # Do the concatenation HERE instead of predicting whether it would
+            # succeed. Modelling torch.cat's preconditions — the previous
+            # attempt compared trailing dims and dtype — under-approximates
+            # them: 0-dim tensors, tensors on different devices and a sparse
+            # tensor beside a dense one all passed that check, were agreed on
+            # by every rank, and then raised at the cat AFTER the collective,
+            # which is the one-sided failure this function exists to prevent.
+            # It over-approximates them too: cat legacy-skips shape-(0,)
+            # tensors, so a legitimate batch was rejected. Attempting it is
+            # exact, and the result is reused below, so it costs nothing.
+            try:
+                prepared[k] = torch.cat(list(v), dim=0)
+            except Exception as exc:
+                problems.append(
+                    f'rank {rank}: key {_safe_repr(k)} holds a list of tensors '
+                    f'that cannot be concatenated: {exc}'
+                )
+                local[k] = ('object', (), '')
             else:
-                gathered[k] = gather_object(v_list)
+                local[k] = ('tensor_list', tuple(prepared[k].shape[1:]),
+                            str(prepared[k].dtype))
+        else:
+            local[k] = ('object', (), '')
+
+    # Keys travel through pickle. A key whose hash is its identity comes back
+    # as a DIFFERENT object, so `batch.get(k)` misses on the very rank holding
+    # the data and it vanishes with no error.
+    #
+    # Pickling can also simply fail, and `k not in restored` calls __eq__,
+    # which can raise. Both used to escape right here — on one rank — which is
+    # the very shape this pre-collective check was written to remove. So the
+    # attempt is guarded and its failure becomes another shipped problem; when
+    # the keys cannot be pickled `local` cannot be shipped either, so it is
+    # emptied and the peers learn why from `problems`.
+    unstable: list[str] = []
+    try:
+        restored = pickle.loads(pickle.dumps(dict.fromkeys(batch)))
+        unstable = [_safe_repr(k) for k in batch if k not in restored]
+    except Exception as exc:
+        problems.append(
+            f'rank {rank}: batch keys cannot be round-tripped through pickle, '
+            f'so they cannot be gathered at all: {exc!r}'
+        )
+        local = {}
+
+    per_rank: list[Any] = [None] * dist.get_world_size()   # type: ignore[list-item]
+    dist.all_gather_object(per_rank, (local, problems, unstable))
+
+    all_problems = [msg for entry in per_rank for msg in (entry or ((), (), ()))[1]]
+    if all_problems:
+        raise TypeError(
+            'this batch cannot be gathered: ' + '; '.join(all_problems)
+        )
+    all_unstable = [
+        f'rank {r}: {key}'
+        for r, entry in enumerate(per_rank) for key in (entry or ((), (), ()))[2]
+    ]
+    if all_unstable:
+        raise TypeError(
+            f'these batch keys do not survive a pickle round-trip by value '
+            f'(identity-based hash or eq?) — gathering them would silently '
+            f'discard the holding rank\'s data: {"; ".join(all_unstable)}'
+        )
+    per_rank = [(entry or ({}, (), ()))[0] for entry in per_rank]
+
+    # Insertion order over per_rank, which is byte-identical on every rank, so
+    # every rank issues the collectives in the SAME order. Sorting by repr()
+    # looked equivalent but a key with the default __repr__ sorts by memory
+    # address: each rank orders the keys differently and pairs one key's
+    # all_gather with another's, which hangs rather than fails.
+    kinds: dict[Any, tuple] = {}
+    disagree: dict[Any, set] = {}
+    for rank_map in per_rank:
+        for k, spec in (rank_map or {}).items():
+            # 'object' is also what a rank reports for an empty list, so a
+            # concrete kind from any rank wins
+            if k not in kinds or (kinds[k][0] == 'object' and spec[0] != 'object'):
+                if k in kinds and kinds[k][0] != 'object' and kinds[k] != spec:
+                    disagree.setdefault(k, {kinds[k]}).add(spec)
+                kinds[k] = spec
+            elif spec[0] != 'object' and spec != kinds[k]:
+                disagree.setdefault(k, {kinds[k]}).add(spec)
+    if disagree:
+        # Every rank computes this from the same gathered data, so every rank
+        # raises together — a one-sided failure here is what hangs the others.
+        # Silently taking one rank's spec reinterprets another's bytes: an
+        # int64 rank gathering a float32 rank's rows produced 1077936128 for
+        # 3.0, which reads like a plausible metric.
+        raise TypeError(
+            'ranks disagree about what these batch keys hold: '
+            + '; '.join(f'{k!r}: {sorted(v)}' for k, v in disagree.items())
+        )
+
+    gathered = {}
+    for k in kinds:
+        kind, shape_tail, dtype_str = kinds[k]
+        v = batch.get(k)
+        if kind in ('tensor', 'tensor_list'):
+            if isinstance(v, Tensor):
+                local_t = v
+            elif k in prepared:
+                local_t = prepared[k]      # concatenated before the collective
+            else:
+                if v is not None and not (isinstance(v, (list, tuple)) and len(v) == 0):
+                    # ranks disagree about what this key holds. Contributing
+                    # nothing keeps this rank in the same collective as the
+                    # others; raising here would leave them waiting on a peer
+                    # that has already gone.
+                    logger.warning(
+                        f"rank {get_global_rank()} holds {type(v).__name__} for "
+                        f"key {k!r} while the batch agreed on {kind}; its value "
+                        f"is dropped from the gather"
+                    )
+                # this rank has nothing for this key: contribute zero rows so
+                # it still takes part in the same collective
+                dtype = getattr(torch, dtype_str.replace('torch.', ''), None)
+                if dtype is None:
+                    # never guess: a wrong dtype here is gathered into the
+                    # metric as plausible-looking numbers
+                    raise TypeError(
+                        f'cannot reconstruct dtype {dtype_str!r} for key {k!r} '
+                        f'while gathering from a rank that has no data for it'
+                    )
+                local_t = torch.empty((0, *shape_tail), dtype=dtype,
+                                      device=torch_device())
+            gathered[k] = tensor_all_gather(local_t)
+        else:
+            if v is None:
+                payload: list = []
+            elif isinstance(v, (list, tuple)):
+                payload = list(v)
+            else:
+                payload = [v]        # never explode a str into characters
+            gathered[k] = gather_object(payload)
 
     return gathered
 
