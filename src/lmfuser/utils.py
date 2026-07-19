@@ -277,12 +277,30 @@ def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
         if kind in ('tensor', 'tensor_list'):
             if isinstance(v, Tensor):
                 local_t = v
-            elif isinstance(v, (list, tuple)) and len(v) > 0:
+            elif (isinstance(v, (list, tuple)) and len(v) > 0
+                  and isinstance(v[0], Tensor)):
                 local_t = torch.cat(list(v), dim=0)
             else:
+                if v is not None and not (isinstance(v, (list, tuple)) and len(v) == 0):
+                    # ranks disagree about what this key holds. Contributing
+                    # nothing keeps this rank in the same collective as the
+                    # others; raising here would leave them waiting on a peer
+                    # that has already gone.
+                    logger.warning(
+                        f"rank {get_global_rank()} holds {type(v).__name__} for "
+                        f"key {k!r} while the batch agreed on {kind}; its value "
+                        f"is dropped from the gather"
+                    )
                 # this rank has nothing for this key: contribute zero rows so
                 # it still takes part in the same collective
-                dtype = getattr(torch, dtype_str.replace('torch.', ''), torch.float32)
+                dtype = getattr(torch, dtype_str.replace('torch.', ''), None)
+                if dtype is None:
+                    # never guess: a wrong dtype here is gathered into the
+                    # metric as plausible-looking numbers
+                    raise TypeError(
+                        f'cannot reconstruct dtype {dtype_str!r} for key {k!r} '
+                        f'while gathering from a rank that has no data for it'
+                    )
                 local_t = torch.empty((0, *shape_tail), dtype=dtype,
                                       device=torch_device())
             gathered[k] = tensor_all_gather(local_t)
