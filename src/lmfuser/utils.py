@@ -260,47 +260,73 @@ def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
     # its peers are still waiting in — a clean error on one rank, a NCCL
     # watchdog hang on every other. Anything that can reject the gather has to
     # be decided from data every rank holds.
+    rank = get_global_rank()
     local: dict[Any, tuple] = {}
-    ragged: list[str] = []
+    prepared: dict[Any, Tensor] = {}
+    problems: list[str] = []
+
+    def _safe_repr(obj: Any) -> str:
+        try:
+            return repr(obj)
+        except Exception as exc:      # a __repr__ that raises must not decide
+            return f'<{type(obj).__name__} with an unusable __repr__: {exc!r}>'
+
     for k, v in batch.items():
         if isinstance(v, Tensor):
             local[k] = ('tensor', tuple(v.shape[1:]), str(v.dtype))
         elif isinstance(v, (list, tuple)) and len(v) > 0 and isinstance(v[0], Tensor):
-            # The spec used to be sampled from v[0] alone, so a list whose
-            # tensors disagree past dim 0 produced a spec every rank AGREED
-            # with — and then torch.cat below raised on this rank only. Check
-            # the whole list here; cat(dim=0) needs matching trailing dims and
-            # a single dtype, which is exactly what this compares.
-            tails = {tuple(t.shape[1:]) if isinstance(t, Tensor) else None for t in v}
-            dtypes = {str(t.dtype) if isinstance(t, Tensor) else None for t in v}
-            if len(tails) > 1 or len(dtypes) > 1 or None in tails:
-                ragged.append(
-                    f'{k!r} (rank {get_global_rank()}: shapes past dim 0 '
-                    f'{sorted(str(x) for x in tails)}, dtypes {sorted(str(x) for x in dtypes)})'
+            # Do the concatenation HERE instead of predicting whether it would
+            # succeed. Modelling torch.cat's preconditions — the previous
+            # attempt compared trailing dims and dtype — under-approximates
+            # them: 0-dim tensors, tensors on different devices and a sparse
+            # tensor beside a dense one all passed that check, were agreed on
+            # by every rank, and then raised at the cat AFTER the collective,
+            # which is the one-sided failure this function exists to prevent.
+            # It over-approximates them too: cat legacy-skips shape-(0,)
+            # tensors, so a legitimate batch was rejected. Attempting it is
+            # exact, and the result is reused below, so it costs nothing.
+            try:
+                prepared[k] = torch.cat(list(v), dim=0)
+            except Exception as exc:
+                problems.append(
+                    f'rank {rank}: key {_safe_repr(k)} holds a list of tensors '
+                    f'that cannot be concatenated: {exc}'
                 )
                 local[k] = ('object', (), '')
             else:
-                local[k] = ('tensor_list', tuple(v[0].shape[1:]), str(v[0].dtype))
+                local[k] = ('tensor_list', tuple(prepared[k].shape[1:]),
+                            str(prepared[k].dtype))
         else:
             local[k] = ('object', (), '')
 
     # Keys travel through pickle. A key whose hash is its identity comes back
     # as a DIFFERENT object, so `batch.get(k)` misses on the very rank holding
-    # the data. Testing that here — against a local round-trip, shipped with
-    # the specs — is what makes it symmetric; the old check ran after the
-    # collective against the local `batch`, so only the rank owning the odd
-    # key raised and the rest hung.
-    restored = pickle.loads(pickle.dumps(dict.fromkeys(batch)))
-    unstable = [repr(k) for k in batch if k not in restored]
+    # the data and it vanishes with no error.
+    #
+    # Pickling can also simply fail, and `k not in restored` calls __eq__,
+    # which can raise. Both used to escape right here — on one rank — which is
+    # the very shape this pre-collective check was written to remove. So the
+    # attempt is guarded and its failure becomes another shipped problem; when
+    # the keys cannot be pickled `local` cannot be shipped either, so it is
+    # emptied and the peers learn why from `problems`.
+    unstable: list[str] = []
+    try:
+        restored = pickle.loads(pickle.dumps(dict.fromkeys(batch)))
+        unstable = [_safe_repr(k) for k in batch if k not in restored]
+    except Exception as exc:
+        problems.append(
+            f'rank {rank}: batch keys cannot be round-tripped through pickle, '
+            f'so they cannot be gathered at all: {exc!r}'
+        )
+        local = {}
 
     per_rank: list[Any] = [None] * dist.get_world_size()   # type: ignore[list-item]
-    dist.all_gather_object(per_rank, (local, ragged, unstable))
+    dist.all_gather_object(per_rank, (local, problems, unstable))
 
-    all_ragged = [msg for entry in per_rank for msg in (entry or ((), (), ()))[1]]
-    if all_ragged:
+    all_problems = [msg for entry in per_rank for msg in (entry or ((), (), ()))[1]]
+    if all_problems:
         raise TypeError(
-            'these batch keys hold tensor lists that cannot be concatenated: '
-            + '; '.join(all_ragged)
+            'this batch cannot be gathered: ' + '; '.join(all_problems)
         )
     all_unstable = [
         f'rank {r}: {key}'
@@ -349,9 +375,8 @@ def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
         if kind in ('tensor', 'tensor_list'):
             if isinstance(v, Tensor):
                 local_t = v
-            elif (isinstance(v, (list, tuple)) and len(v) > 0
-                  and isinstance(v[0], Tensor)):
-                local_t = torch.cat(list(v), dim=0)
+            elif k in prepared:
+                local_t = prepared[k]      # concatenated before the collective
             else:
                 if v is not None and not (isinstance(v, (list, tuple)) and len(v) == 0):
                     # ranks disagree about what this key holds. Contributing

@@ -1366,6 +1366,17 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             with open(runner_path, 'r') as f:
                 runner_state = json.load(f)
                 self.step = int(runner_state['step'])
-                self.pre_epoch = int(runner_state['epoch'])
+                # runner.json's `epoch` is the FULL count — it was written as
+                # self.epoch, which already includes the loaders' progress.
+                # When the data stream is restored too, the loaders replay that
+                # progress and report it again, so adding it here counted every
+                # completed epoch twice, and once more for every further
+                # resume (2 + 2 = 4 after one). pre_epoch exists for the case
+                # where the stream restarts from scratch and that history would
+                # otherwise be lost; carry it only then.
+                self.pre_epoch = (
+                    0 if getattr(self, '_resume_data_states', None)
+                    else int(runner_state['epoch'])
+                )
         else:
             logger.warning(f'runner.json not found in {directory}, skip loading runner state')

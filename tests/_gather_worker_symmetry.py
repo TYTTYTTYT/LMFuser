@@ -80,6 +80,63 @@ def main() -> None:
         'identity-hash key on one rank',
     )
 
+    # torch.cat's preconditions are not two rules. Each of these passed a
+    # trailing-dims-and-dtype check, was agreed on by every rank, and then
+    # raised at the cat AFTER the collective.
+    _expect_raises_everywhere(
+        {'x': [torch.tensor(1.0), torch.tensor(2.0)]} if rank == 0
+        else {'x': [torch.zeros(2)]},
+        '0-dim tensors in a list',
+    )
+    _expect_raises_everywhere(
+        {'x': [torch.zeros(2, 2).to_sparse(), torch.zeros(2, 2)]} if rank == 0
+        else {'x': [torch.zeros(2, 2)]},
+        'sparse beside dense',
+    )
+
+    # ... and it accepts more than those two rules allow. cat legacy-skips
+    # shape-(0,) tensors, so rejecting this batch was a false positive.
+    out = batch_all_gather({'x': [torch.zeros(0), torch.zeros(2, 3)]})
+    assert tuple(out['x'].shape) == (2 * dist.get_world_size(), 3), out['x'].shape
+    for label, value in (
+        ('1-D of differing length', [torch.zeros(3), torch.zeros(5)]),
+        ('0-row beside rows', [torch.zeros(0, 3), torch.zeros(2, 3)]),
+        ('single element', [torch.zeros(2, 3)]),
+    ):
+        batch_all_gather({'x': value})   # must not raise
+    if rank == 0:
+        print('legitimate tensor lists still gather (no false positives)')
+
+    # a key that cannot be pickled at all, and one whose __eq__ raises: both
+    # used to escape from the pre-collective check itself, on one rank.
+    class Unpicklable:
+        def __hash__(self) -> int:
+            return 7
+
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, Unpicklable)
+
+        def __reduce__(self):
+            raise TypeError('this key cannot be pickled')
+
+    class BadEq:
+        def __hash__(self) -> int:
+            return 9
+
+        def __eq__(self, other: object) -> bool:
+            raise ValueError('__eq__ exploded')
+
+    _expect_raises_everywhere(
+        {Unpicklable(): torch.zeros(2, 3)} if rank == 0
+        else {'fine': torch.zeros(2, 3)},
+        'unpicklable key on one rank',
+    )
+    _expect_raises_everywhere(
+        {BadEq(): torch.zeros(2, 3)} if rank == 0
+        else {'fine': torch.zeros(2, 3)},
+        'key whose __eq__ raises, on one rank',
+    )
+
     # a healthy batch must still gather, and to the same result everywhere
     out = batch_all_gather({'x': torch.full((2, 3), float(rank)),
                             'y': [f'r{rank}']})

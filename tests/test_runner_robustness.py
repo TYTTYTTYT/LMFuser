@@ -19,6 +19,11 @@ import subprocess
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+# lmfuser 0.4.8 needs lmfuser_data.slowest_epoch, which the installed package
+# may predate; prefer the sibling working copy when one is checked out.
+_DATA_SRC = os.path.join(os.path.dirname(__file__), '..', '..', 'LMFuser-Data', 'src')
+if os.path.isdir(_DATA_SRC):
+    sys.path.insert(0, _DATA_SRC)
 
 
 def _derive(base: int) -> int:
@@ -132,10 +137,65 @@ def test_state_loads_on_cpu() -> None:
     print('PASS 5: optimizer/scheduler state deserializes on CPU')
 
 
+def test_epoch_takes_the_slowest_task_and_the_right_weight() -> None:
+    """DDPRunner.epoch: slowest train task, weights indexed by TASK id.
+
+    train_data_loaders is per task and holds None for eval-only tasks, while
+    train_task_weights is packed to the train tasks only — zipping the two
+    pairs a loader with another task's weight as soon as any task is eval-only.
+    And `max` let the fastest task end the epoch for the whole run.
+    """
+    from lmfuser.runners.ddp_runner import DDPRunner
+
+    class FakeLoader:
+        def __init__(self, epoch: int) -> None:
+            self.epoch = epoch
+
+    class Fake:
+        pass
+
+    # task 0: train (epoch 7), task 1: eval-only, task 2: train (epoch 2)
+    fake = Fake()
+    fake.train_data_loaders = [FakeLoader(7), None, FakeLoader(2)]
+    fake.train_task_idxs = [0, 2]
+    fake.task_weights = [1.0, 5.0, 1.0]
+    fake.pre_epoch = 0
+    assert DDPRunner.epoch.fget(fake) == 2, \
+        f'expected the slowest train task (2), got {DDPRunner.epoch.fget(fake)}'
+
+    # a zero-weight task is never sampled and must not stall the run
+    fake.task_weights = [1.0, 5.0, 0.0]
+    assert DDPRunner.epoch.fget(fake) == 7, \
+        f'zero-weight task stalled the epoch: {DDPRunner.epoch.fget(fake)}'
+
+    # no train tasks at all
+    fake.train_task_idxs = []
+    fake.pre_epoch = 3
+    assert DDPRunner.epoch.fget(fake) == 3
+    print('PASS 6: epoch is the slowest train task, weighted by task id')
+
+
+def test_pre_epoch_is_not_double_counted_on_resume() -> None:
+    """runner.json's `epoch` was written as self.epoch, which already includes
+    the loaders' progress. Restoring it into pre_epoch WHILE the data stream is
+    also restored counts every completed epoch twice, and once more per resume.
+    """
+    src = open(os.path.join(os.path.dirname(__file__), '..', 'src', 'lmfuser',
+                            'runners', 'ddp_runner.py')).read()
+    idx = src.index('self.pre_epoch = (')
+    assign = src[idx:idx + 200]
+    assert '_resume_data_states' in assign, (
+        'pre_epoch is restored unconditionally — it double-counts whenever '
+        'the data stream is restored alongside it')
+    print('PASS 7: pre_epoch is carried only when the data stream restarts')
+
+
 if __name__ == '__main__':
     test_seed_is_deterministic_across_processes()
     test_seed_survives_a_resume()
     test_config_seed_not_mutated()
     test_checkpoint_is_atomic()
     test_state_loads_on_cpu()
+    test_epoch_takes_the_slowest_task_and_the_right_weight()
+    test_pre_epoch_is_not_double_counted_on_resume()
     print('ALL PASS')
