@@ -188,6 +188,13 @@ def gather_object(local_object: T) -> list[T]:
     
     return gathered # type: ignore
 
+def torch_device() -> Union[str, int]:
+    """`get_default_device()` reports -1 for CPU, which torch rejects as a
+    device index. Everything that actually constructs a tensor needs this."""
+    dev = get_default_device()
+    return 'cpu' if dev == -1 else dev
+
+
 def tensor_all_gather(tensor: Tensor) -> Tensor:
     """Gather along dim 0 across ranks, allowing different lengths.
 
@@ -199,7 +206,7 @@ def tensor_all_gather(tensor: Tensor) -> Tensor:
     """
     if get_world_size() <= 1:
         return tensor
-    device = get_default_device()
+    device = torch_device()
     src = tensor.contiguous().to(device)
 
     counts = torch.zeros(dist.get_world_size(), dtype=torch.long, device=device)
@@ -233,30 +240,60 @@ def batch_all_gather(batch: dict[str, Any]) -> dict[str, Any]:
     if not dist.is_initialized():
         return batch
 
-    # Agree on the key set FIRST. This issued one collective per local key in
-    # local dict order, so any rank holding a different set of keys — a task
-    # that returns a metric only on some steps, or a rank whose eval slice is
-    # empty — made a different number of collective calls and the job hung.
-    keys: list[Any] = [None] * dist.get_world_size()      # type: ignore[list-item]
-    dist.all_gather_object(keys, sorted(batch.keys(), key=repr))
-    union: list[Any] = []
-    for per_rank in keys:
-        for k in per_rank or []:
-            if k not in union:
-                union.append(k)
-    union.sort(key=repr)
+    # Agree on the key set AND on what kind of value each key holds, before
+    # issuing anything.
+    #
+    # This used to loop over the local dict, so a rank with a different key set
+    # — a task emitting a metric only on some steps, or a rank whose eval slice
+    # is empty — made a different NUMBER of collective calls and the job hung.
+    # Agreeing only on the keys is not enough either: the branch below is
+    # chosen from the local value, so a rank holding tensors would call
+    # all_gather while a rank missing that key called all_gather_object. Same
+    # count, different collective, same hang.
+    local: dict[Any, tuple] = {}
+    for k, v in batch.items():
+        if isinstance(v, Tensor):
+            local[k] = ('tensor', tuple(v.shape[1:]), str(v.dtype))
+        elif isinstance(v, (list, tuple)) and len(v) > 0 and isinstance(v[0], Tensor):
+            local[k] = ('tensor_list', tuple(v[0].shape[1:]), str(v[0].dtype))
+        else:
+            local[k] = ('object', (), '')
+
+    per_rank: list[Any] = [None] * dist.get_world_size()   # type: ignore[list-item]
+    dist.all_gather_object(per_rank, local)
+
+    kinds: dict[Any, tuple] = {}
+    for rank_map in per_rank:
+        for k, spec in (rank_map or {}).items():
+            # 'object' is also what a rank reports for an empty list, so a
+            # concrete kind from any rank wins
+            if k not in kinds or (kinds[k][0] == 'object' and spec[0] != 'object'):
+                kinds[k] = spec
 
     gathered = {}
-    for k in union:
-        v_list = batch.get(k)
-        if isinstance(v_list, Tensor):
-            gathered[k] = tensor_all_gather(v_list)
-        elif v_list and isinstance(v_list[0], Tensor):
-            gathered[k] = tensor_all_gather(torch.cat(v_list, dim=0))
+    for k in sorted(kinds, key=repr):
+        kind, shape_tail, dtype_str = kinds[k]
+        v = batch.get(k)
+        if kind in ('tensor', 'tensor_list'):
+            if isinstance(v, Tensor):
+                local_t = v
+            elif isinstance(v, (list, tuple)) and len(v) > 0:
+                local_t = torch.cat(list(v), dim=0)
+            else:
+                # this rank has nothing for this key: contribute zero rows so
+                # it still takes part in the same collective
+                dtype = getattr(torch, dtype_str.replace('torch.', ''), torch.float32)
+                local_t = torch.empty((0, *shape_tail), dtype=dtype,
+                                      device=torch_device())
+            gathered[k] = tensor_all_gather(local_t)
         else:
-            # a rank without this key contributes an empty list, so every rank
-            # still makes exactly one call per key in the union
-            gathered[k] = gather_object(list(v_list) if v_list else [])
+            if v is None:
+                payload: list = []
+            elif isinstance(v, (list, tuple)):
+                payload = list(v)
+            else:
+                payload = [v]        # never explode a str into characters
+            gathered[k] = gather_object(payload)
 
     return gathered
 
