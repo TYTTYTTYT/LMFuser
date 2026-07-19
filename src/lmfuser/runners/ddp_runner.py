@@ -326,14 +326,18 @@ class DDPRunnerConfig(RunerConf):
 
     @property
     def _default_precision(self) -> torch.dtype:
-        if self.model_precision == 'fp32':
-            return torch.float32
-        elif self.model_precision == 'fp16':
-            return torch.float16
-        elif self.model_precision == 'bf16':
-            return torch.bfloat16
-        else:
-            raise ValueError(self.model_precision)
+        # `model_precision` is an OptionArg, and Arg defines no __eq__, so
+        # comparing it to a str was False on every branch and this property
+        # raised for every valid value. Read the value, as _num_acc_steps does.
+        precision = self.model_precision.value()
+        try:
+            return {
+                'fp32': torch.float32,
+                'fp16': torch.float16,
+                'bf16': torch.bfloat16,
+            }[precision]
+        except KeyError:
+            raise ValueError(f'Unknown model precision "{precision}"')
 
     @property
     def _num_acc_steps(self) -> int:
