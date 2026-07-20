@@ -297,6 +297,15 @@ class DDPRunnerConfig(RunerConf):
 
     grad_norm_clip = FloatArg(None, min_value=0.0, allow_none=True)
 
+    # When an optimizer step's gradients hold a NaN or Inf, skip that step
+    # instead of letting it reach the optimizer. A single non-finite gradient
+    # otherwise poisons the (fused) moment buffers permanently, so every step
+    # after it is NaN — which is exactly how a healthy run silently turns into
+    # `loss=nan` forever. CAVEAT: on the fp16 path GradScaler already skips
+    # non-finite steps as part of loss scaling and this switch has no effect
+    # there; it governs the bf16 / fp32 (no-scaler) path.
+    skip_nan_and_inf_grad = BoolArg(default=True)
+
     task_conf = Tasks()
 
     optimizer: OptimizerConfig = OptimizerConfig()
@@ -384,6 +393,12 @@ class DDPRunnerConfig(RunerConf):
 
 
 class DDPRunner(Runner[DDPRunnerConfig]):
+
+    # Consecutive non-finite optimizer steps tolerated before the NaN/Inf grad
+    # guard aborts the run. The guard keeps the model from being poisoned, so a
+    # brief spike is skipped and forgotten; a sustained streak means the run has
+    # genuinely diverged and should fail loud rather than spin at a frozen model.
+    _NONFINITE_STREAK_ABORT = 100
 
     def __init__(self, config: DDPRunnerConfig, *args, **kwargs) -> None:
         super().__init__(config, *args, **kwargs)
@@ -769,6 +784,11 @@ class DDPRunner(Runner[DDPRunnerConfig]):
         else:
             self.scaler = scaler
 
+        # Count of consecutive non-finite optimizer steps, kept on-device so the
+        # NaN/Inf grad guard never has to sync to update it. Created lazily on
+        # first use (we need the grads' device). See _one_train_step.
+        self._nf_streak: Union[Tensor, None] = None
+
     def _next_train_batch(self, task_idx: int) -> Batch:
         if self.train_data_loaders[task_idx] is None:
             raise ValueError(f'No train dataloader for task {task_idx}')
@@ -1002,6 +1022,7 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             self._pbar_status(loss=f'{running_loss:.3g}@{self.step}')
 
         grad_norm_clip_val = self.config.grad_norm_clip.value()
+        norm_t = None
         if grad_norm_clip_val is not None:
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
@@ -1033,6 +1054,60 @@ class DDPRunner(Runner[DDPRunnerConfig]):
             f'{task.__class__.__name__}/train/num_total_params': num_total_params,
             f'{task.__class__.__name__}/train/hot_ratio': num_hot_params / num_total_params,
         }, console=log_this)
+
+        # --- NaN/Inf gradient guard (no-scaler path only) ---------------------
+        # The fp16 GradScaler already skips non-finite steps as part of loss
+        # scaling; this covers the bf16 / fp32 path, which has no scaler and
+        # would otherwise step straight into the optimizer and poison its state.
+        if self.config.skip_nan_and_inf_grad.value() and self.scaler is None:
+            if norm_t is None:
+                # Clipping was off, so nothing has reduced the grads yet. One
+                # foreach norm gives a non-finite signal without a host sync.
+                grads = [p.grad for p in self.model.parameters()
+                         if p.grad is not None]
+                norm_t = (torch.stack(torch._foreach_norm(grads)) if grads
+                          else torch.zeros(1, device=torch_device()))
+            # A single GPU bool; `.all()` unifies the scalar (clipped) and the
+            # per-tensor (unclipped) cases. No `.item()`, so no per-step sync.
+            nonfinite = ~torch.isfinite(norm_t).all()
+            if getattr(self.optimizer, '_step_supports_amp_scaling', False):
+                # fused / amp-aware optimizer: hand it the found_inf flag and it
+                # no-ops the update inside the kernel — the moment buffers are
+                # never touched. This is exactly what GradScaler does for fp16.
+                self.optimizer.grad_scale = None
+                self.optimizer.found_inf = nonfinite.to(torch.float32)
+            else:
+                # fallback for optimizers without the found_inf channel (foreach
+                # impls, Adadelta, fused=False): scrub the grads so a non-finite
+                # step becomes a no-op. Done UNCONDITIONALLY — `if nonfinite:`
+                # would read the GPU flag and reintroduce a per-step host sync,
+                # the very thing this design avoids; nan_to_num is a passthrough
+                # on the finite 99.99% of steps. torch has no
+                # _foreach_nan_to_num_, hence the per-tensor loop.
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        torch.nan_to_num_(param.grad, nan=0.0, posinf=0.0,
+                                          neginf=0.0)
+            # Consecutive non-finite steps, accumulated on-device. Read only on
+            # log steps (which already sync), so persistent divergence fails
+            # loud instead of the run silently spinning at a frozen model.
+            if self._nf_streak is None:
+                self._nf_streak = torch.zeros((), device=nonfinite.device,
+                                              dtype=torch.long)
+            self._nf_streak = torch.where(
+                nonfinite, self._nf_streak + 1,
+                torch.zeros_like(self._nf_streak))
+            if log_this:
+                streak = int(self._nf_streak.item())
+                self.step_log({
+                    f'{task.__class__.__name__}/train/nonfinite_grad_streak':
+                    streak})
+                if streak >= self._NONFINITE_STREAK_ABORT:
+                    raise RuntimeError(
+                        f'gradients were non-finite for {streak} consecutive '
+                        f'optimizer steps — training has diverged. '
+                        f'skip_nan_and_inf_grad kept the optimizer from being '
+                        f'poisoned, but the model is no longer learning.')
 
         if self.scaler is not None:
             self.scaler.step(self.optimizer)
